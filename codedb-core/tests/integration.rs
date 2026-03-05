@@ -191,3 +191,76 @@ fn test_symbol_extraction() {
     let stats2 = db.parse_symbols().unwrap();
     assert_eq!(stats2.blobs_parsed, 0, "Second run should parse 0 blobs");
 }
+
+#[test]
+fn test_sourcegraph_queries() {
+    let tmp = TempDir::new().unwrap();
+    let mut db = CodeDB::open(tmp.path()).unwrap();
+
+    db.index_repo("https://github.com/ylow/SFrameRust/").unwrap();
+    db.parse_symbols().unwrap();
+
+    // Code search — basic
+    let results = db.search("FlexType").unwrap();
+    assert!(
+        !results.rows.is_empty(),
+        "Code search for FlexType should return results"
+    );
+
+    // Code search — with lang filter
+    let results = db.search("lang:rust serialize").unwrap();
+    assert!(
+        !results.rows.is_empty(),
+        "Code search with lang:rust should return results"
+    );
+
+    // Code search — with file glob
+    let results = db.search("file:*.rs struct").unwrap();
+    assert!(
+        !results.rows.is_empty(),
+        "Code search with file glob should return results"
+    );
+
+    // Symbol search
+    let results = db.search("type:symbol lang:rust SFrame").unwrap();
+    assert!(
+        !results.rows.is_empty(),
+        "Symbol search should find SFrame"
+    );
+
+    // Symbol search with kind filter
+    let results = db
+        .search("type:symbol select:symbol.function lang:rust read")
+        .unwrap();
+    assert!(
+        !results.rows.is_empty(),
+        "Symbol search for functions named 'read' should return results"
+    );
+
+    // Diff search
+    let results = db.search("type:diff streaming").unwrap();
+    assert!(
+        !results.rows.is_empty(),
+        "Diff search for 'streaming' should return results"
+    );
+
+    // Commit search
+    let results = db.search("type:commit author:Yucheng").unwrap();
+    assert!(
+        !results.rows.is_empty(),
+        "Commit search by author should return results"
+    );
+
+    // translate_query returns SQL
+    let translated = db.translate_query("lang:rust type:symbol foo").unwrap();
+    assert!(translated.sql.contains("symbols"));
+    assert!(translated.sql.contains("b.language"));
+    assert!(!translated.params.is_empty());
+
+    // Negative file filter
+    let results = db.search("-file:test struct").unwrap();
+    assert!(
+        !results.rows.is_empty(),
+        "Code search with -file:test should return results"
+    );
+}
