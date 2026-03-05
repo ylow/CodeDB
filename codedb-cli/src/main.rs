@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use codedb_core::CodeDB;
+use codedb_core::{CodeDB, SearchType};
 
 #[derive(Parser)]
 #[command(name = "codedb", about = "Code indexing and search")]
@@ -20,10 +20,24 @@ enum Commands {
         /// Repository URL
         url: String,
     },
-    /// Search indexed code
+    /// Search indexed code using Sourcegraph query syntax
+    ///
+    /// Supports filters: repo:, file:, -file:, lang:, type:, rev:, count:,
+    /// author:, before:, after:, message:, select:
+    ///
+    /// Examples:
+    ///   codedb search "process_data"
+    ///   codedb search "lang:rust file:*.rs process_data"
+    ///   codedb search "type:symbol lang:rust SFrame"
+    ///   codedb search "type:diff author:ylow streaming"
+    ///   codedb search "type:commit before:2026-01-01 refactor"
     Search {
-        /// Search query
+        /// Search query (Sourcegraph syntax)
         query: String,
+
+        /// Print generated SQL instead of executing
+        #[arg(long)]
+        sql: bool,
     },
     /// Run raw SQL query
     Sql {
@@ -52,32 +66,62 @@ fn main() -> Result<()> {
             db.index_repo(&url)?;
             println!("Parsing symbols...");
             let stats = db.parse_symbols()?;
-            println!("Done. Parsed {} blobs, extracted {} symbols.", stats.blobs_parsed, stats.symbols_extracted);
+            println!(
+                "Done. Parsed {} blobs, extracted {} symbols.",
+                stats.blobs_parsed, stats.symbols_extracted
+            );
         }
-        Commands::Search { query } => {
+        Commands::Search { query, sql: show_sql } => {
             let db = CodeDB::open(&root)?;
-            let mut stmt = db.conn().prepare(
-                "SELECT fr.path, cs.score, cs.snippet
-                 FROM code_search(?1) cs
-                 JOIN blobs b ON b.id = cs.blob_id
-                 JOIN file_revs fr ON fr.blob_id = b.id
-                 JOIN refs r ON r.commit_id = fr.commit_id
-                 GROUP BY fr.path
-                 ORDER BY cs.score DESC
-                 LIMIT 20"
-            )?;
-            let results = stmt.query_map([&query], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, f64>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })?;
-            for row in results {
-                let (path, score, snippet) = row?;
-                println!("{path} (score: {score:.2})");
-                println!("  {snippet}");
-                println!();
+
+            if show_sql {
+                let translated = db.translate_query(&query)?;
+                println!("-- Sourcegraph query: {query}");
+                println!("-- Parameters: {:?}", translated.params);
+                println!("{}", translated.sql);
+                return Ok(());
+            }
+
+            let results = db.search(&query)?;
+
+            if results.rows.is_empty() {
+                println!("No results found.");
+                return Ok(());
+            }
+
+            for row in &results.rows {
+                match results.search_type {
+                    SearchType::Code => {
+                        let path = &row.columns[0].1;
+                        let score = &row.columns[1].1;
+                        let snippet = &row.columns[2].1;
+                        println!("{path} (score: {score})");
+                        println!("  {snippet}");
+                        println!();
+                    }
+                    SearchType::Diff => {
+                        let hash = &row.columns[0].1;
+                        let message = &row.columns[1].1;
+                        let path = &row.columns[2].1;
+                        let score = &row.columns[3].1;
+                        println!("{hash} {path} (score: {score})");
+                        println!("  {message}");
+                        println!();
+                    }
+                    SearchType::Commit => {
+                        let hash = &row.columns[0].1;
+                        let author = &row.columns[1].1;
+                        let message = &row.columns[2].1;
+                        println!("{hash} ({author}) {message}");
+                    }
+                    SearchType::Symbol => {
+                        let path = &row.columns[0].1;
+                        let name = &row.columns[1].1;
+                        let kind = &row.columns[2].1;
+                        let line = &row.columns[3].1;
+                        println!("{path}:{line} {kind} {name}");
+                    }
+                }
             }
         }
         Commands::Sql { query } => {
