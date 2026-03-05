@@ -120,6 +120,11 @@ impl CodeDB {
         self.diff_reader.reload()?;
         Ok(())
     }
+
+    /// Index a git repository by URL: clone/fetch, walk commits, populate DB and search indexes.
+    pub fn index_repo(&mut self, url: &str) -> Result<()> {
+        crate::indexer::index_repo(self, url)
+    }
 }
 
 #[cfg(test)]
