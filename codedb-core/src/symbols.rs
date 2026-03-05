@@ -30,7 +30,6 @@ pub(crate) struct ExtractedRef {
     pub kind: String,
     pub line: usize,
     pub col: usize,
-    pub start_byte: usize,
     /// Index into the symbols vec of the containing symbol definition.
     pub containing_symbol_index: Option<usize>,
 }
@@ -310,19 +309,19 @@ pub(crate) fn extract_symbols(
     // nearest enclosing parent.  We use a stack of (index, end_byte).
     {
         let mut stack: Vec<(usize, usize)> = Vec::new(); // (index, end_byte)
-        for i in 0..symbols.len() {
+        for (i, sym) in symbols.iter_mut().enumerate() {
             // Pop anything that has already ended before this symbol starts.
             while let Some(&(_, parent_end)) = stack.last() {
-                if parent_end <= symbols[i].start_byte {
+                if parent_end <= sym.start_byte {
                     stack.pop();
                 } else {
                     break;
                 }
             }
             if let Some(&(parent_idx, _)) = stack.last() {
-                symbols[i].parent_index = Some(parent_idx);
+                sym.parent_index = Some(parent_idx);
             }
-            stack.push((i, symbols[i].end_byte));
+            stack.push((i, sym.end_byte));
         }
     }
 
@@ -359,7 +358,6 @@ pub(crate) fn extract_symbols(
                     kind: "call".to_string(),
                     line: start.row + 1,
                     col: start.column + 1,
-                    start_byte: node.start_byte(),
                     containing_symbol_index: containing,
                 });
             }
@@ -478,50 +476,47 @@ pub fn parse_symbols(
                 }
             };
 
-            match extract_symbols(&content, &config) {
-                Some((symbols, refs)) => {
-                    let mut symbol_db_ids: Vec<i64> = Vec::with_capacity(symbols.len());
-                    for sym in &symbols {
-                        conn.execute(
-                            "INSERT INTO symbols (blob_id, parent_id, name, kind, line, col, end_line, end_col)
-                             VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7)",
-                            rusqlite::params![
-                                blob_id, sym.name, sym.kind,
-                                sym.line, sym.col, sym.end_line, sym.end_col
-                            ],
-                        )?;
-                        symbol_db_ids.push(conn.last_insert_rowid());
-                    }
-
-                    // Update parent_id for nested symbols
-                    for (i, sym) in symbols.iter().enumerate() {
-                        if let Some(parent_idx) = sym.parent_index {
-                            let parent_db_id = symbol_db_ids[parent_idx];
-                            let sym_db_id = symbol_db_ids[i];
-                            conn.execute(
-                                "UPDATE symbols SET parent_id = ?1 WHERE id = ?2",
-                                rusqlite::params![parent_db_id, sym_db_id],
-                            )?;
-                        }
-                    }
-
-                    // Insert refs
-                    for r in &refs {
-                        let symbol_id =
-                            r.containing_symbol_index.map(|idx| symbol_db_ids[idx]);
-                        conn.execute(
-                            "INSERT INTO symbol_refs (blob_id, symbol_id, ref_name, kind, line, col)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                            rusqlite::params![
-                                blob_id, symbol_id, r.ref_name, r.kind, r.line, r.col
-                            ],
-                        )?;
-                    }
-
-                    total_symbols += symbols.len() as u64;
-                    total_blobs += 1;
+            if let Some((symbols, refs)) = extract_symbols(&content, &config) {
+                let mut symbol_db_ids: Vec<i64> = Vec::with_capacity(symbols.len());
+                for sym in &symbols {
+                    conn.execute(
+                        "INSERT INTO symbols (blob_id, parent_id, name, kind, line, col, end_line, end_col)
+                         VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        rusqlite::params![
+                            blob_id, sym.name, sym.kind,
+                            sym.line, sym.col, sym.end_line, sym.end_col
+                        ],
+                    )?;
+                    symbol_db_ids.push(conn.last_insert_rowid());
                 }
-                None => {}
+
+                // Update parent_id for nested symbols
+                for (i, sym) in symbols.iter().enumerate() {
+                    if let Some(parent_idx) = sym.parent_index {
+                        let parent_db_id = symbol_db_ids[parent_idx];
+                        let sym_db_id = symbol_db_ids[i];
+                        conn.execute(
+                            "UPDATE symbols SET parent_id = ?1 WHERE id = ?2",
+                            rusqlite::params![parent_db_id, sym_db_id],
+                        )?;
+                    }
+                }
+
+                // Insert refs
+                for r in &refs {
+                    let symbol_id =
+                        r.containing_symbol_index.map(|idx| symbol_db_ids[idx]);
+                    conn.execute(
+                        "INSERT INTO symbol_refs (blob_id, symbol_id, ref_name, kind, line, col)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        rusqlite::params![
+                            blob_id, symbol_id, r.ref_name, r.kind, r.line, r.col
+                        ],
+                    )?;
+                }
+
+                total_symbols += symbols.len() as u64;
+                total_blobs += 1;
             }
 
             conn.execute(
