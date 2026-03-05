@@ -1,7 +1,12 @@
+use std::sync::Arc;
+
+use rusqlite::Connection;
 use tantivy::schema::Field;
 use tantivy::{Index, IndexReader};
 
 use crate::types::{tantivy_type_to_sql, ColumnDef, ColumnSource};
+use crate::vtab::{register_vtab, VTabState};
+use crate::vtab_helpers::generate_ddl;
 
 #[derive(Debug)]
 pub enum BuildError {
@@ -98,6 +103,13 @@ impl TantivyVTabBuilder {
         self
     }
 
+    /// Validate, build, and register the virtual table in one step.
+    pub fn register(self, conn: &Connection, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let validated = self.validate()?;
+        validated.register(conn, name)?;
+        Ok(())
+    }
+
     /// Validate and finalize the builder, returning a ValidatedVTab ready for registration.
     pub fn validate(mut self) -> Result<ValidatedVTab, BuildError> {
         let index = self.index.ok_or(BuildError::MissingIndex)?;
@@ -160,6 +172,20 @@ pub struct ValidatedVTab {
     pub search_fields: Vec<Field>,
     pub columns: Vec<ColumnDef>,
     pub default_limit: usize,
+}
+
+impl ValidatedVTab {
+    pub fn register(self, conn: &Connection, name: &str) -> Result<(), rusqlite::Error> {
+        let state = Arc::new(VTabState {
+            ddl: generate_ddl(name, &self.columns),
+            index: self.index,
+            reader: self.reader,
+            search_fields: self.search_fields,
+            columns: self.columns,
+            default_limit: self.default_limit,
+        });
+        register_vtab(conn, name, state)
+    }
 }
 
 #[cfg(test)]
