@@ -1,0 +1,11 @@
+[package]
+name = "tantivy-sqlite"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tantivy = "0.22"
+rusqlite = { version = "0.32", features = ["bundled", "vtab"] }
+
+[dev-dependencies]
+tempfile = "3"
