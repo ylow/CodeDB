@@ -216,7 +216,7 @@ unsafe impl VTabCursor for TantivyCursor<'_> {
                 .iter()
                 .map(|col| match &col.source {
                     ColumnSource::StoredField(field) => {
-                        doc.get_first(*field).map(|v| v.clone())
+                        doc.get_first(*field).cloned()
                     }
                     _ => None,
                 })

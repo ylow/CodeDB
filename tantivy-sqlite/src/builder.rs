@@ -27,10 +27,10 @@ impl std::fmt::Display for BuildError {
             BuildError::MissingReader => write!(f, "reader is required"),
             BuildError::NoSearchFields => write!(f, "at least one search field is required"),
             BuildError::NoColumns => write!(f, "at least one column is required"),
-            BuildError::FieldNotStored(n) => write!(f, "field '{}' is not stored", n),
-            BuildError::UnsupportedFieldType(n) => write!(f, "field '{}' has unsupported type", n),
-            BuildError::SnippetFieldNotText(n) => write!(f, "snippet field '{}' is not TEXT", n),
-            BuildError::DuplicateColumnName(n) => write!(f, "duplicate column name '{}'", n),
+            BuildError::FieldNotStored(n) => write!(f, "field '{n}' is not stored"),
+            BuildError::UnsupportedFieldType(n) => write!(f, "field '{n}' has unsupported type"),
+            BuildError::SnippetFieldNotText(n) => write!(f, "snippet field '{n}' is not TEXT"),
+            BuildError::DuplicateColumnName(n) => write!(f, "duplicate column name '{n}'"),
         }
     }
 }
@@ -43,6 +43,12 @@ pub struct TantivyVTabBuilder {
     search_fields: Vec<Field>,
     columns: Vec<ColumnDef>,
     default_limit: usize,
+}
+
+impl Default for TantivyVTabBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TantivyVTabBuilder {
@@ -143,7 +149,7 @@ impl TantivyVTabBuilder {
                     }
                     let ty = entry.field_type().value_type();
                     col.sql_type = tantivy_type_to_sql(ty)
-                        .ok_or_else(|| BuildError::UnsupportedFieldType(name))?;
+                        .ok_or(BuildError::UnsupportedFieldType(name))?;
                 }
                 ColumnSource::Snippet(field) => {
                     let entry = schema.get_field_entry(*field);

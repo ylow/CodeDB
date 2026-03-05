@@ -13,8 +13,8 @@ impl std::fmt::Display for QueryBuildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             QueryBuildError::EmptyQuery => write!(f, "query string is empty"),
-            QueryBuildError::ParseError(e) => write!(f, "query parse error: {}", e),
-            QueryBuildError::UnknownMode(m) => write!(f, "unknown query mode: '{}'", m),
+            QueryBuildError::ParseError(e) => write!(f, "query parse error: {e}"),
+            QueryBuildError::UnknownMode(m) => write!(f, "unknown query mode: '{m}'"),
         }
     }
 }
