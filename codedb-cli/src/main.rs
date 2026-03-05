@@ -50,7 +50,9 @@ fn main() -> Result<()> {
             let mut db = CodeDB::open(&root)?;
             println!("Indexing {url}...");
             db.index_repo(&url)?;
-            println!("Done.");
+            println!("Parsing symbols...");
+            let stats = db.parse_symbols()?;
+            println!("Done. Parsed {} blobs, extracted {} symbols.", stats.blobs_parsed, stats.symbols_extracted);
         }
         Commands::Search { query } => {
             let db = CodeDB::open(&root)?;
