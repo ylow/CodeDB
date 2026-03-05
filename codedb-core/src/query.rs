@@ -339,16 +339,252 @@ fn translate_code(query: &ParsedQuery) -> Result<TranslatedQuery> {
     })
 }
 
-fn translate_diff(_query: &ParsedQuery) -> Result<TranslatedQuery> {
-    todo!("Implemented in Task 4")
+fn translate_diff(query: &ParsedQuery) -> Result<TranslatedQuery> {
+    if query.search_pattern.is_empty() {
+        bail!("Diff search requires a search pattern");
+    }
+
+    let mut p = ParamCollector::new();
+    let search_param = p.add(query.search_pattern.clone());
+
+    let mut joins = vec![
+        "JOIN diffs d ON d.id = ds.diff_id".to_string(),
+        "JOIN commits c ON c.id = d.commit_id".to_string(),
+    ];
+    let mut conditions = Vec::new();
+
+    if let Some(ref repo) = query.filters.repo {
+        joins.push("JOIN repos rp ON rp.id = c.repo_id".to_string());
+        let clause = pattern_match_clause("rp.name", repo, &mut p);
+        conditions.push(format!("AND {clause}"));
+    }
+
+    if let Some(ref file) = query.filters.file {
+        let clause = pattern_match_clause("d.path", file, &mut p);
+        conditions.push(format!("AND {clause}"));
+    }
+
+    if let Some(ref neg_file) = query.filters.neg_file {
+        let clause = pattern_match_clause("d.path", neg_file, &mut p);
+        conditions.push(format!("AND NOT ({clause})"));
+    }
+
+    if let Some(ref author) = query.filters.author {
+        let clause = pattern_match_clause("c.author", author, &mut p);
+        conditions.push(format!("AND {clause}"));
+    }
+
+    if let Some(ref before) = query.filters.before {
+        let placeholder = p.add(before.clone());
+        conditions.push(format!(
+            "AND c.timestamp < CAST(strftime('%s', {placeholder}) AS INTEGER)"
+        ));
+    }
+
+    if let Some(ref after) = query.filters.after {
+        let placeholder = p.add(after.clone());
+        conditions.push(format!(
+            "AND c.timestamp > CAST(strftime('%s', {placeholder}) AS INTEGER)"
+        ));
+    }
+
+    let limit = query.filters.count.unwrap_or(20);
+
+    let conditions_str = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!("\n  {}", conditions.join("\n  "))
+    };
+
+    let joins_str = joins.join("\n");
+
+    let select_clause = match &query.filters.select {
+        Some(SelectType::File) => "SELECT DISTINCT d.path",
+        _ => "SELECT substr(c.hash, 1, 10) AS hash,\n       \
+              substr(c.message, 1, 80) AS message,\n       \
+              d.path, round(ds.score, 2) AS score",
+    };
+
+    let order_by = match &query.filters.select {
+        Some(SelectType::File) => "ORDER BY d.path",
+        _ => "ORDER BY ds.score DESC",
+    };
+
+    let sql = format!(
+        "{select_clause}\n\
+         FROM diff_search({search_param}) ds\n\
+         {joins_str}\n\
+         WHERE 1=1{conditions_str}\n\
+         {order_by}\n\
+         LIMIT {limit}"
+    );
+
+    Ok(TranslatedQuery {
+        sql,
+        params: p.params,
+        search_type: SearchType::Diff,
+    })
 }
 
-fn translate_commit(_query: &ParsedQuery) -> Result<TranslatedQuery> {
-    todo!("Implemented in Task 4")
+fn translate_commit(query: &ParsedQuery) -> Result<TranslatedQuery> {
+    let mut p = ParamCollector::new();
+    let mut conditions = Vec::new();
+
+    if !query.search_pattern.is_empty() {
+        let clause = pattern_match_clause("c.message", &query.search_pattern, &mut p);
+        conditions.push(format!("AND {clause}"));
+    }
+
+    if let Some(ref message) = query.filters.message {
+        let clause = pattern_match_clause("c.message", message, &mut p);
+        conditions.push(format!("AND {clause}"));
+    }
+
+    let mut joins = Vec::new();
+
+    if let Some(ref repo) = query.filters.repo {
+        joins.push("JOIN repos rp ON rp.id = c.repo_id".to_string());
+        let clause = pattern_match_clause("rp.name", repo, &mut p);
+        conditions.push(format!("AND {clause}"));
+    }
+
+    if let Some(ref author) = query.filters.author {
+        let clause = pattern_match_clause("c.author", author, &mut p);
+        conditions.push(format!("AND {clause}"));
+    }
+
+    if let Some(ref before) = query.filters.before {
+        let placeholder = p.add(before.clone());
+        conditions.push(format!(
+            "AND c.timestamp < CAST(strftime('%s', {placeholder}) AS INTEGER)"
+        ));
+    }
+
+    if let Some(ref after) = query.filters.after {
+        let placeholder = p.add(after.clone());
+        conditions.push(format!(
+            "AND c.timestamp > CAST(strftime('%s', {placeholder}) AS INTEGER)"
+        ));
+    }
+
+    if conditions.is_empty() {
+        bail!(
+            "Commit search requires a search pattern or at least one filter \
+             (author:, before:, after:, message:)"
+        );
+    }
+
+    let limit = query.filters.count.unwrap_or(20);
+
+    let conditions_str = format!("\n  {}", conditions.join("\n  "));
+
+    let joins_str = if joins.is_empty() {
+        String::new()
+    } else {
+        format!("\n{}", joins.join("\n"))
+    };
+
+    let sql = format!(
+        "SELECT substr(c.hash, 1, 10) AS hash, c.author,\n       \
+         substr(c.message, 1, 80) AS message\n\
+         FROM commits c{joins_str}\n\
+         WHERE 1=1{conditions_str}\n\
+         ORDER BY c.timestamp DESC\n\
+         LIMIT {limit}"
+    );
+
+    Ok(TranslatedQuery {
+        sql,
+        params: p.params,
+        search_type: SearchType::Commit,
+    })
 }
 
-fn translate_symbol(_query: &ParsedQuery) -> Result<TranslatedQuery> {
-    todo!("Implemented in Task 4")
+fn translate_symbol(query: &ParsedQuery) -> Result<TranslatedQuery> {
+    let mut p = ParamCollector::new();
+    let mut joins = vec![
+        "JOIN blobs b ON b.id = s.blob_id".to_string(),
+        "JOIN file_revs fr ON fr.blob_id = b.id".to_string(),
+        "JOIN refs r ON r.commit_id = fr.commit_id".to_string(),
+    ];
+    let mut conditions = Vec::new();
+
+    if !query.search_pattern.is_empty() {
+        let clause = pattern_match_clause("s.name", &query.search_pattern, &mut p);
+        conditions.push(format!("AND {clause}"));
+    }
+
+    if let Some(ref repo) = query.filters.repo {
+        joins.push("JOIN repos rp ON rp.id = r.repo_id".to_string());
+        let clause = pattern_match_clause("rp.name", repo, &mut p);
+        conditions.push(format!("AND {clause}"));
+    }
+
+    if let Some(ref file) = query.filters.file {
+        let clause = pattern_match_clause("fr.path", file, &mut p);
+        conditions.push(format!("AND {clause}"));
+    }
+
+    if let Some(ref neg_file) = query.filters.neg_file {
+        let clause = pattern_match_clause("fr.path", neg_file, &mut p);
+        conditions.push(format!("AND NOT ({clause})"));
+    }
+
+    if let Some(ref lang) = query.filters.lang {
+        let placeholder = p.add(lang.clone());
+        conditions.push(format!("AND b.language = {placeholder}"));
+    }
+
+    if let Some(SelectType::SymbolKind(ref kind)) = query.filters.select {
+        let placeholder = p.add(kind.clone());
+        conditions.push(format!("AND s.kind = {placeholder}"));
+    }
+
+    // rev: filter
+    let rev = query.filters.rev.clone().unwrap_or_else(|| "main".to_string());
+    let rev_ref = if rev.starts_with("refs/") {
+        rev
+    } else {
+        format!("refs/heads/{rev}")
+    };
+    let rev_placeholder = p.add(rev_ref);
+    conditions.push(format!("AND r.name = {rev_placeholder}"));
+
+    if query.search_pattern.is_empty()
+        && !matches!(query.filters.select, Some(SelectType::SymbolKind(_)))
+        && query.filters.lang.is_none()
+        && query.filters.file.is_none()
+    {
+        bail!(
+            "Symbol search requires a search pattern or filter \
+             (lang:, file:, select:symbol.<kind>)"
+        );
+    }
+
+    let limit = query.filters.count.unwrap_or(20);
+
+    let conditions_str = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!("\n  {}", conditions.join("\n  "))
+    };
+
+    let joins_str = joins.join("\n");
+
+    let sql = format!(
+        "SELECT fr.path, s.name, s.kind, s.line\n\
+         FROM symbols s\n\
+         {joins_str}\n\
+         WHERE 1=1{conditions_str}\n\
+         ORDER BY fr.path, s.line\n\
+         LIMIT {limit}"
+    );
+
+    Ok(TranslatedQuery {
+        sql,
+        params: p.params,
+        search_type: SearchType::Symbol,
+    })
 }
 
 #[cfg(test)]
@@ -578,5 +814,98 @@ mod tests {
         let t = translate(&q).unwrap();
         assert!(t.sql.contains("GLOB"));
         assert!(t.params.iter().any(|p| p == "*.rs"));
+    }
+
+    // --- Diff search tests ---
+
+    #[test]
+    fn test_translate_diff_basic() {
+        let q = parse_query("type:diff streaming").unwrap();
+        let t = translate(&q).unwrap();
+        assert_eq!(t.search_type, SearchType::Diff);
+        assert!(t.sql.contains("diff_search(?1)"));
+        assert_eq!(t.params[0], "streaming");
+    }
+
+    #[test]
+    fn test_translate_diff_with_author() {
+        let q = parse_query("type:diff author:ylow streaming").unwrap();
+        let t = translate(&q).unwrap();
+        assert!(t.sql.contains("c.author"));
+        assert!(t.params.iter().any(|p| p.contains("ylow")));
+    }
+
+    #[test]
+    fn test_translate_diff_with_dates() {
+        let q = parse_query("type:diff before:2026-01-01 after:2025-06-01 streaming").unwrap();
+        let t = translate(&q).unwrap();
+        assert!(t.sql.contains("c.timestamp <"));
+        assert!(t.sql.contains("c.timestamp >"));
+        assert!(t.sql.contains("strftime"));
+    }
+
+    #[test]
+    fn test_translate_diff_empty_pattern_error() {
+        let q = parse_query("type:diff").unwrap();
+        let err = translate(&q).unwrap_err();
+        assert!(err.to_string().contains("requires a search pattern"), "got: {err}");
+    }
+
+    // --- Commit search tests ---
+
+    #[test]
+    fn test_translate_commit_basic() {
+        let q = parse_query("type:commit refactor").unwrap();
+        let t = translate(&q).unwrap();
+        assert_eq!(t.search_type, SearchType::Commit);
+        assert!(t.sql.contains("commits c"));
+        assert!(t.sql.contains("c.message LIKE"));
+    }
+
+    #[test]
+    fn test_translate_commit_author_only() {
+        let q = parse_query("type:commit author:ylow").unwrap();
+        let t = translate(&q).unwrap();
+        assert!(t.sql.contains("c.author"));
+    }
+
+    #[test]
+    fn test_translate_commit_no_filters_error() {
+        let q = parse_query("type:commit").unwrap();
+        let err = translate(&q).unwrap_err();
+        assert!(err.to_string().contains("requires a search pattern"), "got: {err}");
+    }
+
+    // --- Symbol search tests ---
+
+    #[test]
+    fn test_translate_symbol_basic() {
+        let q = parse_query("type:symbol process_data").unwrap();
+        let t = translate(&q).unwrap();
+        assert_eq!(t.search_type, SearchType::Symbol);
+        assert!(t.sql.contains("symbols s"));
+        assert!(t.sql.contains("s.name LIKE"));
+    }
+
+    #[test]
+    fn test_translate_symbol_with_lang() {
+        let q = parse_query("type:symbol lang:rust SFrame").unwrap();
+        let t = translate(&q).unwrap();
+        assert!(t.sql.contains("b.language ="));
+    }
+
+    #[test]
+    fn test_translate_symbol_kind_filter() {
+        let q = parse_query("type:symbol select:symbol.function lang:rust foo").unwrap();
+        let t = translate(&q).unwrap();
+        assert!(t.sql.contains("s.kind ="));
+        assert!(t.params.iter().any(|p| p == "function"));
+    }
+
+    #[test]
+    fn test_translate_symbol_no_filters_error() {
+        let q = parse_query("type:symbol").unwrap();
+        let err = translate(&q).unwrap_err();
+        assert!(err.to_string().contains("requires a search pattern"), "got: {err}");
     }
 }
