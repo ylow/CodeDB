@@ -1,3 +1,4 @@
+use anyhow::{Context, Result};
 use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator};
 
 /// Configuration for a single language's tree-sitter grammar and queries.
@@ -381,6 +382,170 @@ fn find_containing_symbol(symbols: &[ExtractedSymbol], byte_offset: usize) -> Op
         }
     }
     best
+}
+
+// ---------------------------------------------------------------------------
+// Database integration
+// ---------------------------------------------------------------------------
+
+pub struct ParseStats {
+    pub blobs_parsed: u64,
+    pub symbols_extracted: u64,
+}
+
+/// Parse symbols for all unparsed blobs that have a supported language.
+/// Reads blob content from git repos listed in the repos table.
+pub fn parse_symbols(
+    conn: &rusqlite::Connection,
+    repos_dir: &std::path::Path,
+) -> Result<ParseStats> {
+    let langs = supported_languages();
+    let placeholders: Vec<String> = langs
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 1))
+        .collect();
+    let in_clause = placeholders.join(", ");
+
+    let query = format!(
+        "SELECT id, content_hash, language FROM blobs WHERE parsed = 0 AND language IN ({in_clause})"
+    );
+    let mut stmt = conn.prepare(&query)?;
+    let params: Vec<&dyn rusqlite::types::ToSql> =
+        langs.iter().map(|l| l as &dyn rusqlite::types::ToSql).collect();
+    let rows: Vec<(i64, String, String)> = stmt
+        .query_map(params.as_slice(), |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+
+    if rows.is_empty() {
+        return Ok(ParseStats {
+            blobs_parsed: 0,
+            symbols_extracted: 0,
+        });
+    }
+
+    // Open all repos for reading blob content
+    let mut repos = Vec::new();
+    {
+        let mut repo_stmt = conn.prepare("SELECT path FROM repos")?;
+        let paths: Vec<String> = repo_stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        for path_str in paths {
+            let full_path = if std::path::Path::new(&path_str).is_absolute() {
+                std::path::PathBuf::from(&path_str)
+            } else {
+                repos_dir.join(&path_str)
+            };
+            if let Ok(repo) = gix::open(&full_path) {
+                repos.push(repo);
+            }
+        }
+    }
+
+    conn.execute_batch("BEGIN TRANSACTION")?;
+
+    let result = (|| -> Result<ParseStats> {
+        let mut total_symbols = 0u64;
+        let mut total_blobs = 0u64;
+
+        for (blob_id, content_hash, language) in &rows {
+            let config = match get_config(language) {
+                Some(c) => c,
+                None => continue,
+            };
+
+            // Read blob content from git object store
+            let oid = gix::ObjectId::from_hex(content_hash.as_bytes())
+                .context("Invalid content_hash")?;
+            let content = repos.iter().find_map(|repo| {
+                repo.find_object(oid)
+                    .ok()
+                    .and_then(|obj| String::from_utf8(obj.data.clone()).ok())
+            });
+
+            let content = match content {
+                Some(c) => c,
+                None => {
+                    // Mark as parsed even if content not found (binary or missing)
+                    conn.execute(
+                        "UPDATE blobs SET parsed = 1 WHERE id = ?1",
+                        rusqlite::params![blob_id],
+                    )?;
+                    continue;
+                }
+            };
+
+            match extract_symbols(&content, &config) {
+                Some((symbols, refs)) => {
+                    let mut symbol_db_ids: Vec<i64> = Vec::with_capacity(symbols.len());
+                    for sym in &symbols {
+                        conn.execute(
+                            "INSERT INTO symbols (blob_id, parent_id, name, kind, line, col, end_line, end_col)
+                             VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7)",
+                            rusqlite::params![
+                                blob_id, sym.name, sym.kind,
+                                sym.line, sym.col, sym.end_line, sym.end_col
+                            ],
+                        )?;
+                        symbol_db_ids.push(conn.last_insert_rowid());
+                    }
+
+                    // Update parent_id for nested symbols
+                    for (i, sym) in symbols.iter().enumerate() {
+                        if let Some(parent_idx) = sym.parent_index {
+                            let parent_db_id = symbol_db_ids[parent_idx];
+                            let sym_db_id = symbol_db_ids[i];
+                            conn.execute(
+                                "UPDATE symbols SET parent_id = ?1 WHERE id = ?2",
+                                rusqlite::params![parent_db_id, sym_db_id],
+                            )?;
+                        }
+                    }
+
+                    // Insert refs
+                    for r in &refs {
+                        let symbol_id =
+                            r.containing_symbol_index.map(|idx| symbol_db_ids[idx]);
+                        conn.execute(
+                            "INSERT INTO symbol_refs (blob_id, symbol_id, ref_name, kind, line, col)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                            rusqlite::params![
+                                blob_id, symbol_id, r.ref_name, r.kind, r.line, r.col
+                            ],
+                        )?;
+                    }
+
+                    total_symbols += symbols.len() as u64;
+                    total_blobs += 1;
+                }
+                None => {}
+            }
+
+            conn.execute(
+                "UPDATE blobs SET parsed = 1 WHERE id = ?1",
+                rusqlite::params![blob_id],
+            )?;
+        }
+
+        Ok(ParseStats {
+            blobs_parsed: total_blobs,
+            symbols_extracted: total_symbols,
+        })
+    })();
+
+    match result {
+        Ok(stats) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(stats)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

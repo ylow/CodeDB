@@ -125,6 +125,11 @@ impl CodeDB {
     pub fn index_repo(&mut self, url: &str) -> Result<()> {
         crate::indexer::index_repo(self, url)
     }
+
+    /// Parse symbols for all unparsed blobs that have a supported language.
+    pub fn parse_symbols(&self) -> Result<crate::symbols::ParseStats> {
+        crate::symbols::parse_symbols(self.conn(), &self.repos_dir())
+    }
 }
 
 #[cfg(test)]

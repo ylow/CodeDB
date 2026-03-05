@@ -6,3 +6,4 @@ pub mod schema;
 pub(crate) mod symbols;
 
 pub use codedb::CodeDB;
+pub use symbols::ParseStats;
