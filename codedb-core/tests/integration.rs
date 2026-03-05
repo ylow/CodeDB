@@ -115,3 +115,79 @@ fn test_incremental_update() {
         "No duplicate commits after re-index"
     );
 }
+
+#[test]
+fn test_symbol_extraction() {
+    let tmp = TempDir::new().unwrap();
+    let mut db = CodeDB::open(tmp.path()).unwrap();
+
+    db.index_repo("https://github.com/ylow/SFrameRust/")
+        .unwrap();
+    let stats = db.parse_symbols().unwrap();
+
+    assert!(stats.blobs_parsed > 0, "Should have parsed some blobs");
+    assert!(
+        stats.symbols_extracted > 0,
+        "Should have extracted symbols"
+    );
+
+    let conn = db.conn();
+
+    // Verify symbols table populated
+    let symbol_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
+        .unwrap();
+    assert!(symbol_count > 0, "Should have symbols");
+
+    // Verify symbol_refs table populated
+    let ref_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM symbol_refs", [], |r| r.get(0))
+        .unwrap();
+    assert!(ref_count > 0, "Should have symbol refs");
+
+    // Verify all supported-language blobs are marked as parsed
+    let unparsed: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM blobs WHERE parsed = 0 AND language IN ('rust', 'python', 'javascript', 'typescript', 'tsx', 'go', 'c', 'cpp')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(unparsed, 0, "All supported-language blobs should be parsed");
+
+    // Verify "what calls X" query pattern works
+    let callers: Vec<(String, String)> = conn
+        .prepare(
+            "SELECT DISTINCT s.name, s.kind
+             FROM symbol_refs sr
+             JOIN symbols s ON s.id = sr.symbol_id
+             WHERE sr.kind = 'call'
+             LIMIT 10",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(
+        !callers.is_empty(),
+        "Should find callers via symbol_refs join"
+    );
+
+    // Verify parent_id nesting works
+    let nested_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbols WHERE parent_id IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        nested_count > 0,
+        "Should have nested symbols (methods inside impl blocks)"
+    );
+
+    // Run parse_symbols again — should be a no-op
+    let stats2 = db.parse_symbols().unwrap();
+    assert_eq!(stats2.blobs_parsed, 0, "Second run should parse 0 blobs");
+}
