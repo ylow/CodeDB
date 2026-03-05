@@ -138,6 +138,19 @@ let mut stmt = db.conn().prepare(
 )?;
 ```
 
+## Demo
+
+Run the included demo script to index [SFrameRust](https://github.com/ylow/SFrameRust/)
+and see CodeDB in action:
+
+```bash
+./demo.sh
+```
+
+It indexes the full repo (117 commits, 381 unique blobs), then runs a series of
+queries: database stats, language breakdown, full-text code search, diff search,
+file extension filtering, and incremental re-indexing.
+
 ## Building
 
 ```bash
