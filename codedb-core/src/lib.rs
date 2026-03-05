@@ -7,5 +7,5 @@ pub mod schema;
 pub(crate) mod symbols;
 
 pub use codedb::CodeDB;
-pub use query::{ParsedQuery, TranslatedQuery, SearchType};
+pub use query::{Filters, ParsedQuery, SearchType, SelectType, TranslatedQuery};
 pub use symbols::ParseStats;

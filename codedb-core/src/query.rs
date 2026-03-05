@@ -134,4 +134,10 @@ mod tests {
     fn test_tokenize_extra_whitespace() {
         assert_eq!(tokenize("  foo   bar  "), vec!["foo", "bar"]);
     }
+
+    #[test]
+    fn test_tokenize_unclosed_quote() {
+        // Unclosed quote consumes to end of input
+        assert_eq!(tokenize("foo \"bar baz"), vec!["foo", "\"bar baz\""]);
+    }
 }
