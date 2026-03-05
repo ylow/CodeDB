@@ -198,6 +198,159 @@ pub fn parse_query(input: &str) -> Result<ParsedQuery> {
     })
 }
 
+/// Helper: tracks SQL parameters and returns `?N` placeholders.
+struct ParamCollector {
+    params: Vec<String>,
+}
+
+impl ParamCollector {
+    fn new() -> Self {
+        Self { params: Vec::new() }
+    }
+
+    /// Add a parameter and return its `?N` placeholder string.
+    fn add(&mut self, value: String) -> String {
+        self.params.push(value);
+        format!("?{}", self.params.len())
+    }
+}
+
+/// If pattern contains `*` or `?`, use GLOB. Otherwise use LIKE substring match.
+fn pattern_match_clause(column: &str, pattern: &str, p: &mut ParamCollector) -> String {
+    if pattern.contains('*') || pattern.contains('?') {
+        let placeholder = p.add(pattern.to_string());
+        format!("{column} GLOB {placeholder}")
+    } else {
+        let placeholder = p.add(format!("%{pattern}%"));
+        format!("{column} LIKE {placeholder}")
+    }
+}
+
+/// Translate a parsed query into SQL.
+pub fn translate(query: &ParsedQuery) -> Result<TranslatedQuery> {
+    match query.search_type {
+        SearchType::Code => translate_code(query),
+        SearchType::Diff => translate_diff(query),
+        SearchType::Commit => translate_commit(query),
+        SearchType::Symbol => translate_symbol(query),
+    }
+}
+
+fn translate_code(query: &ParsedQuery) -> Result<TranslatedQuery> {
+    if query.search_pattern.is_empty() {
+        bail!("Code search requires a search pattern");
+    }
+
+    let mut p = ParamCollector::new();
+    let search_param = p.add(query.search_pattern.clone());
+
+    let mut joins = vec![
+        "JOIN blobs b ON b.id = cs.blob_id".to_string(),
+        "JOIN file_revs fr ON fr.blob_id = b.id".to_string(),
+        "JOIN refs r ON r.commit_id = fr.commit_id".to_string(),
+    ];
+    let mut conditions = Vec::new();
+
+    if let Some(ref repo) = query.filters.repo {
+        joins.push("JOIN repos rp ON rp.id = r.repo_id".to_string());
+        let clause = pattern_match_clause("rp.name", repo, &mut p);
+        conditions.push(format!("AND {clause}"));
+    }
+
+    if let Some(ref file) = query.filters.file {
+        let clause = pattern_match_clause("fr.path", file, &mut p);
+        conditions.push(format!("AND {clause}"));
+    }
+
+    if let Some(ref neg_file) = query.filters.neg_file {
+        let clause = pattern_match_clause("fr.path", neg_file, &mut p);
+        conditions.push(format!("AND NOT ({clause})"));
+    }
+
+    if let Some(ref lang) = query.filters.lang {
+        let placeholder = p.add(lang.clone());
+        conditions.push(format!("AND b.language = {placeholder}"));
+    }
+
+    // rev: filter (defaults to refs/heads/main)
+    let rev = query.filters.rev.clone().unwrap_or_else(|| "main".to_string());
+    let rev_ref = if rev.starts_with("refs/") {
+        rev
+    } else {
+        format!("refs/heads/{rev}")
+    };
+    let rev_placeholder = p.add(rev_ref);
+    conditions.push(format!("AND r.name = {rev_placeholder}"));
+
+    let limit = query.filters.count.unwrap_or(20);
+
+    // select: modifier changes output
+    let (select_clause, group_by, order_by) = match &query.filters.select {
+        Some(SelectType::Repo) => {
+            if query.filters.repo.is_none() {
+                joins.push("JOIN repos rp ON rp.id = r.repo_id".to_string());
+            }
+            (
+                "SELECT DISTINCT rp.name".to_string(),
+                String::new(),
+                "ORDER BY rp.name".to_string(),
+            )
+        }
+        Some(SelectType::File) => (
+            "SELECT DISTINCT fr.path".to_string(),
+            String::new(),
+            "ORDER BY fr.path".to_string(),
+        ),
+        _ => (
+            "SELECT fr.path, cs.score, cs.snippet".to_string(),
+            "GROUP BY fr.path".to_string(),
+            "ORDER BY cs.score DESC".to_string(),
+        ),
+    };
+
+    let joins_str = joins.join("\n");
+    let conditions_str = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!("\n  {}", conditions.join("\n  "))
+    };
+
+    let sql = format!(
+        "{select_clause}\n\
+         FROM code_search({search_param}) cs\n\
+         {joins_str}\n\
+         WHERE 1=1{conditions_str}\n\
+         {group_by}\n\
+         {order_by}\n\
+         LIMIT {limit}"
+    );
+
+    // Clean up blank lines from empty group_by
+    let sql = sql
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Ok(TranslatedQuery {
+        sql,
+        params: p.params,
+        search_type: SearchType::Code,
+    })
+}
+
+fn translate_diff(_query: &ParsedQuery) -> Result<TranslatedQuery> {
+    todo!("Implemented in Task 4")
+}
+
+fn translate_commit(_query: &ParsedQuery) -> Result<TranslatedQuery> {
+    todo!("Implemented in Task 4")
+}
+
+fn translate_symbol(_query: &ParsedQuery) -> Result<TranslatedQuery> {
+    todo!("Implemented in Task 4")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,5 +501,82 @@ mod tests {
     fn test_parse_lang_alias() {
         let q = parse_query("l:python foo").unwrap();
         assert_eq!(q.filters.lang.as_deref(), Some("python"));
+    }
+
+    // --- SQL generation tests ---
+
+    #[test]
+    fn test_translate_code_basic() {
+        let q = parse_query("process_data").unwrap();
+        let t = translate(&q).unwrap();
+        assert_eq!(t.search_type, SearchType::Code);
+        assert!(t.sql.contains("code_search(?1)"));
+        assert!(t.sql.contains("LIMIT 20"));
+        assert_eq!(t.params[0], "process_data");
+        assert!(t.params.iter().any(|p| p.contains("refs/heads/main")));
+    }
+
+    #[test]
+    fn test_translate_code_with_filters() {
+        let q = parse_query("lang:rust file:*.rs count:10 foo").unwrap();
+        let t = translate(&q).unwrap();
+        assert!(t.sql.contains("b.language ="));
+        assert!(t.sql.contains("fr.path GLOB"));
+        assert!(t.sql.contains("LIMIT 10"));
+        assert_eq!(t.params[0], "foo");
+    }
+
+    #[test]
+    fn test_translate_code_neg_file() {
+        let q = parse_query("-file:test foo").unwrap();
+        let t = translate(&q).unwrap();
+        assert!(t.sql.contains("NOT"));
+        assert!(t.sql.contains("fr.path LIKE"));
+    }
+
+    #[test]
+    fn test_translate_code_repo_filter() {
+        let q = parse_query("repo:SFrame foo").unwrap();
+        let t = translate(&q).unwrap();
+        assert!(t.sql.contains("repos rp"));
+        assert!(t.sql.contains("rp.name LIKE"));
+    }
+
+    #[test]
+    fn test_translate_code_select_file() {
+        let q = parse_query("select:file foo").unwrap();
+        let t = translate(&q).unwrap();
+        assert!(t.sql.contains("SELECT DISTINCT fr.path"));
+        assert!(!t.sql.contains("cs.score"));
+    }
+
+    #[test]
+    fn test_translate_code_custom_rev() {
+        let q = parse_query("rev:develop foo").unwrap();
+        let t = translate(&q).unwrap();
+        assert!(t.params.iter().any(|p| p == "refs/heads/develop"));
+    }
+
+    #[test]
+    fn test_translate_code_empty_pattern_error() {
+        let q = parse_query("lang:rust").unwrap();
+        let err = translate(&q).unwrap_err();
+        assert!(err.to_string().contains("requires a search pattern"), "got: {err}");
+    }
+
+    #[test]
+    fn test_translate_code_substring_match() {
+        let q = parse_query("file:csv foo").unwrap();
+        let t = translate(&q).unwrap();
+        assert!(t.sql.contains("LIKE"));
+        assert!(t.params.iter().any(|p| p == "%csv%"));
+    }
+
+    #[test]
+    fn test_translate_code_glob_match() {
+        let q = parse_query("file:*.rs foo").unwrap();
+        let t = translate(&q).unwrap();
+        assert!(t.sql.contains("GLOB"));
+        assert!(t.params.iter().any(|p| p == "*.rs"));
     }
 }
