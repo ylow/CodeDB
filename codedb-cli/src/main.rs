@@ -48,7 +48,7 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Index { url } => {
             let mut db = CodeDB::open(&root)?;
-            println!("Indexing {}...", url);
+            println!("Indexing {url}...");
             db.index_repo(&url)?;
             println!("Done.");
         }
@@ -73,8 +73,8 @@ fn main() -> Result<()> {
             })?;
             for row in results {
                 let (path, score, snippet) = row?;
-                println!("{} (score: {:.2})", path, score);
-                println!("  {}", snippet);
+                println!("{path} (score: {score:.2})");
+                println!("  {snippet}");
                 println!();
             }
         }
@@ -92,7 +92,7 @@ fn main() -> Result<()> {
                 let vals: Vec<String> = (0..col_count)
                     .map(|i| {
                         row.get::<_, rusqlite::types::Value>(i)
-                            .map(|v| format!("{:?}", v))
+                            .map(|v| format!("{v:?}"))
                             .unwrap_or_else(|_| "NULL".to_string())
                     })
                     .collect();

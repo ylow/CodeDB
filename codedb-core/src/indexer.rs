@@ -20,7 +20,7 @@ fn repo_name_from_url(url: &str) -> Result<String> {
 
     let cleaned = stripped.trim_end_matches('/').trim_end_matches(".git");
     if cleaned.is_empty() {
-        anyhow::bail!("Invalid repo URL: {}", url);
+        anyhow::bail!("Invalid repo URL: {url}");
     }
     Ok(cleaned.to_string())
 }
@@ -54,7 +54,7 @@ pub fn index_repo(db: &mut CodeDB, url: &str) -> Result<()> {
     let dir_name = repo_dir_from_url(url)?;
     let repo_path = db.repos_dir().join(&dir_name);
     let repo = clone_or_fetch(url, &repo_path)
-        .with_context(|| format!("Failed to clone/fetch {}", url))?;
+        .with_context(|| format!("Failed to clone/fetch {url}"))?;
 
     // 2. Upsert into repos table, get repo_id
     let repo_name = repo_name_from_url(url)?;

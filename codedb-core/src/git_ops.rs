@@ -14,9 +14,9 @@ pub fn repo_dir_from_url(url: &str) -> Result<String> {
 
     let cleaned = stripped.trim_end_matches('/').trim_end_matches(".git");
     if cleaned.is_empty() {
-        anyhow::bail!("Invalid repo URL: {}", url);
+        anyhow::bail!("Invalid repo URL: {url}");
     }
-    Ok(format!("{}.git", cleaned))
+    Ok(format!("{cleaned}.git"))
 }
 
 /// Clone a bare repo, or fetch if it already exists.
