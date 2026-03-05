@@ -7,7 +7,7 @@ edition = "2021"
 tantivy = "0.22"
 tantivy-sqlite = { path = "../tantivy-sqlite" }
 rusqlite = { version = "0.32", features = ["bundled", "vtab"] }
-gix = { version = "0.70", features = ["blocking-network-client"] }
+gix = { version = "0.70", features = ["blocking-network-client", "blocking-http-transport-curl"] }
 anyhow = "1"
 
 [dev-dependencies]
