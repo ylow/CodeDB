@@ -51,6 +51,19 @@ pub struct TranslatedQuery {
     pub search_type: SearchType,
 }
 
+/// A single row of search results.
+#[derive(Debug, Clone)]
+pub struct SearchResultRow {
+    pub columns: Vec<(String, String)>,
+}
+
+/// Results from executing a search query.
+#[derive(Debug, Clone)]
+pub struct SearchResults {
+    pub search_type: SearchType,
+    pub rows: Vec<SearchResultRow>,
+}
+
 /// Split input into tokens, respecting quoted strings.
 ///
 /// - Whitespace separates tokens

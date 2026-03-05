@@ -6,6 +6,7 @@ use tantivy::schema::*;
 use tantivy::{Index, IndexReader, IndexWriter};
 use tantivy_sqlite::TantivyVTab;
 
+use crate::query::{self, SearchResults, SearchResultRow, TranslatedQuery};
 use crate::schema::init_schema;
 
 pub struct CodeDB {
@@ -130,6 +131,55 @@ impl CodeDB {
     pub fn parse_symbols(&self) -> Result<crate::symbols::ParseStats> {
         crate::symbols::parse_symbols(self.conn(), &self.repos_dir())
     }
+
+    /// Parse and translate a Sourcegraph-style query to SQL without executing.
+    pub fn translate_query(&self, input: &str) -> Result<TranslatedQuery> {
+        let parsed = query::parse_query(input)?;
+        query::translate(&parsed)
+    }
+
+    /// Parse, translate, and execute a Sourcegraph-style query.
+    pub fn search(&self, input: &str) -> Result<SearchResults> {
+        let translated = self.translate_query(input)?;
+        let search_type = translated.search_type.clone();
+
+        let mut stmt = self.conn.prepare(&translated.sql)?;
+
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = translated
+            .params
+            .iter()
+            .map(|s| s as &dyn rusqlite::types::ToSql)
+            .collect();
+
+        let col_count = stmt.column_count();
+        let col_names: Vec<String> = (0..col_count)
+            .map(|i| stmt.column_name(i).unwrap().to_string())
+            .collect();
+
+        let mut rows = Vec::new();
+        let mut result_rows = stmt.query(param_refs.as_slice())?;
+        while let Some(row) = result_rows.next()? {
+            let columns: Vec<(String, String)> = (0..col_count)
+                .map(|i| {
+                    let name = col_names[i].clone();
+                    let val = row
+                        .get::<_, rusqlite::types::Value>(i)
+                        .map(|v| match v {
+                            rusqlite::types::Value::Null => "NULL".to_string(),
+                            rusqlite::types::Value::Integer(n) => n.to_string(),
+                            rusqlite::types::Value::Real(f) => format!("{f:.2}"),
+                            rusqlite::types::Value::Text(s) => s,
+                            rusqlite::types::Value::Blob(_) => "<blob>".to_string(),
+                        })
+                        .unwrap_or_else(|_| "NULL".to_string());
+                    (name, val)
+                })
+                .collect();
+            rows.push(SearchResultRow { columns });
+        }
+
+        Ok(SearchResults { search_type, rows })
+    }
 }
 
 #[cfg(test)]
@@ -166,5 +216,14 @@ mod tests {
         let _db1 = CodeDB::open(tmp.path()).unwrap();
         drop(_db1);
         let _db2 = CodeDB::open(tmp.path()).unwrap();
+    }
+
+    #[test]
+    fn test_translate_query() {
+        let tmp = TempDir::new().unwrap();
+        let db = CodeDB::open(tmp.path()).unwrap();
+        let t = db.translate_query("lang:rust foo").unwrap();
+        assert!(t.sql.contains("code_search"));
+        assert!(t.sql.contains("b.language"));
     }
 }
