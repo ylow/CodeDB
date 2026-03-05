@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS refs (
 CREATE TABLE IF NOT EXISTS blobs (
     id           INTEGER PRIMARY KEY,
     content_hash TEXT NOT NULL UNIQUE,
-    language     TEXT
+    language     TEXT,
+    parsed       INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS file_revs (
