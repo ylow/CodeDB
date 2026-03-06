@@ -66,7 +66,7 @@ codedb --root ~/.codedb sql "
 
 ## Search Query Syntax
 
-The `search` command uses a Sourcegraph-compatible query language.
+The `search` command uses a [Sourcegraph-compatible query language](#differences-from-sourcegraph).
 Bare words are search terms; filters use `key:value` syntax.
 
 ### Filters
@@ -94,6 +94,55 @@ Bare words are search terms; filters use `key:value` syntax.
 - **`type:symbol`** — Search extracted symbols. Use `select:symbol.KIND` to filter by kind (function, struct, class, etc.).
 - **`type:diff`** — Search within commit diffs. Supports `author:`, `before:`, `after:`, `file:` filters.
 - **`type:commit`** — Search commit metadata. Supports `author:`, `before:`, `after:`, `message:` filters.
+
+## Differences from Sourcegraph
+
+CodeDB implements a subset of the
+[Sourcegraph query language](https://sourcegraph.com/docs/code-search/queries),
+tailored for searching one or a few locally-indexed repositories rather than
+a large multi-tenant instance. Most simple Sourcegraph queries work unchanged.
+
+### What works the same
+
+The core query experience is compatible:
+
+- **Bare search terms** — `error handling` searches file contents, just like Sourcegraph.
+- **Quoted phrases** — `"parse error"` matches the exact phrase.
+- **Filters** — `repo:`, `file:`, `-file:`, `lang:` (alias `l:`), `rev:`, `case:`,
+  `type:` (code/diff/commit/symbol), `select:`, `count:`, `author:`,
+  `before:`, `after:`, `message:` all work as expected.
+
+### What's different
+
+| Area | Sourcegraph | CodeDB |
+|------|------------|--------|
+| **Scope** | Searches across thousands of repositories on a hosted instance. Has `fork:`, `archived:`, `visibility:`, `repogroup:`, `repo:has.file()`, `repo:has.path()`, `file:has.owner()` for filtering across a large corpus. | Designed for one or a few locally-indexed repos. Repository-level metadata filters (`fork:`, `archived:`, `visibility:`, `repogroup:`, `repo:has.*`, `file:has.*`) are not supported — they don't apply at this scale. |
+| **Regex** | Supports `/regex/` patterns and `patterntype:regexp`. | No regex in the query language. Patterns match as substrings (or GLOB wildcards with `*`/`?`). For regex needs, drop to raw SQL where Tantivy supports regex mode. |
+| **Boolean operators** | Full `AND`, `OR`, `NOT` with parenthesized grouping. | All terms are implicitly AND'ed. No `OR`, `NOT`, or parentheses. Only `-file:` negation is supported. |
+| **Structural search** | `type:structural` with [Comby](https://comby.dev/) patterns for syntax-aware matching (e.g., `fmt.Sprintf(:[args])`). | Not supported. CodeDB addresses similar use cases through symbol extraction and cross-reference queries instead. |
+| **Code intelligence** | Separate LSIF/SCIP-based precise code navigation (go-to-definition, find-references). Not part of the query language. | Built into the query language via `calls:`, `calledby:`, and `returns:` filters. Uses tree-sitter extraction — less precise than LSIF/SCIP but requires no separate indexing pipeline. |
+| **`patterntype:`** | Controls interpretation: `literal`, `regexp`, `keyword`, `structural`. | Not supported. Patterns are always literal/substring (GLOB if wildcards present). |
+| **`@revision` syntax** | `repo:foo@branch` to pin a revision. | Use `rev:branch` as a separate filter instead. |
+| **`timeout:`, `stable:`** | Query execution controls. | Not supported (queries run locally and complete fast). |
+
+### Porting queries from Sourcegraph
+
+Most queries port directly:
+
+| Sourcegraph query | CodeDB equivalent |
+|---|---|
+| `lang:go fmt.Sprintf` | `lang:go fmt.Sprintf` (identical) |
+| `file:\.py$ import requests` | `file:*.py import requests` (use GLOB instead of regex) |
+| `repo:myorg/myrepo error` | `repo:myrepo error` (substring match on repo name) |
+| `type:diff author:alice fix` | `type:diff author:alice fix` (identical) |
+| `type:symbol lang:rust Iterator` | `type:symbol lang:rust Iterator` (identical) |
+| `repo:foo@develop query` | `repo:foo rev:develop query` (use `rev:` instead of `@`) |
+| `patterntype:regexp err\d+` | Not directly supported — use `codedb sql` with Tantivy regex mode |
+| `(foo OR bar) lang:go` | Run as two separate queries, or use raw SQL |
+
+**When the query language isn't enough**, use `codedb search --sql` to see the
+generated SQL, then adapt it with `codedb sql` for full control — including
+JOINs, aggregations, regex via Tantivy, and anything else SQLite supports.
 
 ## Symbol Extraction
 
