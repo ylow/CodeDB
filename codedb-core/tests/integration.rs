@@ -6,7 +6,7 @@ fn test_index_sframerust() {
     let tmp = TempDir::new().unwrap();
     let mut db = CodeDB::open(tmp.path()).unwrap();
 
-    db.index_repo("https://github.com/ylow/SFrameRust/")
+    db.index_repo("https://github.com/ylow/SFrameRust/", None, None)
         .unwrap();
 
     let conn = db.conn();
@@ -93,7 +93,7 @@ fn test_incremental_update() {
     let mut db = CodeDB::open(tmp.path()).unwrap();
 
     // First index
-    db.index_repo("https://github.com/ylow/SFrameRust/")
+    db.index_repo("https://github.com/ylow/SFrameRust/", None, None)
         .unwrap();
 
     let commit_count_1: i64 = db
@@ -102,7 +102,7 @@ fn test_incremental_update() {
         .unwrap();
 
     // Re-index (should be incremental, no new commits)
-    db.index_repo("https://github.com/ylow/SFrameRust/")
+    db.index_repo("https://github.com/ylow/SFrameRust/", None, None)
         .unwrap();
 
     let commit_count_2: i64 = db
@@ -121,9 +121,9 @@ fn test_symbol_extraction() {
     let tmp = TempDir::new().unwrap();
     let mut db = CodeDB::open(tmp.path()).unwrap();
 
-    db.index_repo("https://github.com/ylow/SFrameRust/")
+    db.index_repo("https://github.com/ylow/SFrameRust/", None, None)
         .unwrap();
-    let stats = db.parse_symbols().unwrap();
+    let stats = db.parse_symbols(None).unwrap();
 
     assert!(stats.blobs_parsed > 0, "Should have parsed some blobs");
     assert!(
@@ -188,7 +188,7 @@ fn test_symbol_extraction() {
     );
 
     // Run parse_symbols again — should be a no-op
-    let stats2 = db.parse_symbols().unwrap();
+    let stats2 = db.parse_symbols(None).unwrap();
     assert_eq!(stats2.blobs_parsed, 0, "Second run should parse 0 blobs");
 }
 
@@ -197,8 +197,8 @@ fn test_sourcegraph_queries() {
     let tmp = TempDir::new().unwrap();
     let mut db = CodeDB::open(tmp.path()).unwrap();
 
-    db.index_repo("https://github.com/ylow/SFrameRust/").unwrap();
-    db.parse_symbols().unwrap();
+    db.index_repo("https://github.com/ylow/SFrameRust/", None, None).unwrap();
+    db.parse_symbols(None).unwrap();
 
     // Code search — basic
     let results = db.search("FlexType").unwrap();

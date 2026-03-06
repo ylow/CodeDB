@@ -1,7 +1,30 @@
 {
   "permissions": {
     "allow": [
-      "WebSearch"
+      "WebSearch",
+      "Bash(find /Users/ylow/repos/CodeDB -type f \\\\\\( -name \"*query*\" -o -name \"*test*\" \\\\\\) | grep -E \"\\\\.rs$\")",
+      "Bash(cargo check 2>&1 | tail -5)",
+      "Bash(git clone --bare https://github.com/tokio-rs/tokio /tmp/tokio.git 2>&1)",
+      "Bash(du -sh /tmp/tokio.git && git -C /tmp/tokio.git rev-list --count HEAD && git -C /tmp/tokio.git rev-list --count --all)",
+      "Bash(time /Users/ylow/repos/CodeDB/target/release/codedb-cli --root /tmp/codedb-bench index /tmp/tokio.git 2>&1)",
+      "Bash(/Users/ylow/repos/CodeDB/target/release/codedb-cli --help 2>&1)",
+      "Bash(/Users/ylow/repos/CodeDB/target/release/codedb-cli index --help 2>&1)",
+      "Bash(time /Users/ylow/repos/CodeDB/target/release/codedb-cli --root /tmp/codedb-bench index https://github.com/tokio-rs/tokio 2>&1)",
+      "Bash(du -sh /tmp/codedb-bench && du -sh /tmp/codedb-bench/*)",
+      "Bash(time /Users/ylow/repos/CodeDB/target/release/codedb-cli --root /tmp/codedb-bench search \"lang:rust type:symbol select:symbol.function spawn\" 2>&1)",
+      "Bash(time /Users/ylow/repos/CodeDB/target/release/codedb-cli --root /tmp/codedb-bench search \"spawn\" 2>&1 | head -40)",
+      "Bash(/Users/ylow/repos/CodeDB/target/release/codedb-cli --root /tmp/codedb-bench sql \"SELECT COUNT\\(*\\) FROM blobs\" 2>&1 && /Users/ylow/repos/CodeDB/target/release/codedb-cli --root /tmp/codedb-bench sql \"SELECT COUNT\\(*\\) FROM refs\" 2>&1 && /Users/ylow/repos/CodeDB/target/release/codedb-cli --root /tmp/codedb-bench sql \"SELECT DISTINCT name FROM refs LIMIT 10\" 2>&1)",
+      "Bash(/Users/ylow/repos/CodeDB/target/release/codedb-cli --root /tmp/codedb-bench search --sql \"spawn\" 2>&1)",
+      "Bash(time /Users/ylow/repos/CodeDB/target/release/codedb-cli --root /tmp/codedb-bench search \"@rev:master spawn\" 2>&1 | head -40)",
+      "Bash(time /Users/ylow/repos/CodeDB/target/release/codedb-cli --root /tmp/codedb-bench search \"rev:master spawn\" 2>&1 | head -40)",
+      "Bash(echo \"=== Symbol search ===\" && time /Users/ylow/repos/CodeDB/target/release/codedb-cli --root /tmp/codedb-bench search \"rev:master type:symbol Runtime\" 2>&1 | head -20 && echo \"=== Diff search ===\" && time /Users/ylow/repos/CodeDB/target/release/codedb-cli --root /tmp/codedb-bench search \"type:diff spawn\" 2>&1 | head -20 && echo \"=== Commit search ===\" && time /Users/ylow/repos/CodeDB/target/release/codedb-cli --root /tmp/codedb-bench search \"type:commit author:Alice\" 2>&1 | head -20 && echo \"=== Regex search ===\" && time /Users/ylow/repos/CodeDB/target/release/codedb-cli --root /tmp/codedb-bench search \"rev:master /fn\\\\s+spawn/\" 2>&1 | head -20)",
+      "Bash(time /Users/ylow/repos/CodeDB/target/release/codedb-cli --root /tmp/codedb-bench search 'rev:master /fn spawn/' 2>&1 | head -20)",
+      "Bash(time /Users/ylow/repos/CodeDB/target/release/codedb-cli --root /tmp/codedb-bench index https://github.com/python/cpython 2>&1)",
+      "Bash(cargo build --release 2>&1)",
+      "Bash(rm -rf /tmp/codedb-bench && time /Users/ylow/repos/CodeDB/target/release/codedb-cli --root /tmp/codedb-bench index https://github.com/tokio-rs/tokio 2>&1)",
+      "Bash(rm -rf /tmp/codedb-bench && time /Users/ylow/repos/CodeDB/target/release/codedb-cli --root /tmp/codedb-bench --depth 0 index https://github.com/tokio-rs/tokio 2>&1)",
+      "Bash(rm -rf /tmp/codedb-bench && time /Users/ylow/repos/CodeDB/target/release/codedb-cli --root /tmp/codedb-bench index --depth 0 https://github.com/tokio-rs/tokio 2>&1)",
+      "Bash(rm -rf /tmp/codedb-bench && time /Users/ylow/repos/CodeDB/target/release/codedb-cli --root /tmp/codedb-bench index https://github.com/python/cpython 2>&1)"
     ]
   }
 }

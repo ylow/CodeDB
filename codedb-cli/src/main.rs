@@ -19,6 +19,10 @@ enum Commands {
     Index {
         /// Repository URL
         url: String,
+
+        /// Maximum number of commits to walk per ref (0 = unlimited)
+        #[arg(long, default_value = "10000")]
+        depth: usize,
     },
     /// Search indexed code using Sourcegraph query syntax
     ///
@@ -60,13 +64,15 @@ fn main() -> Result<()> {
     let root = expand_tilde(&cli.root);
 
     match cli.command {
-        Commands::Index { url } => {
+        Commands::Index { url, depth } => {
             let mut db = CodeDB::open(&root)?;
-            println!("Indexing {url}...");
-            db.index_repo(&url)?;
-            println!("Parsing symbols...");
-            let stats = db.parse_symbols()?;
-            println!(
+            let progress = |msg: &str| {
+                eprintln!("{msg}");
+            };
+            let max_depth = if depth == 0 { None } else { Some(depth) };
+            db.index_repo(&url, Some(&progress), max_depth)?;
+            let stats = db.parse_symbols(Some(&progress))?;
+            eprintln!(
                 "Done. Parsed {} blobs, extracted {} symbols.",
                 stats.blobs_parsed, stats.symbols_extracted
             );

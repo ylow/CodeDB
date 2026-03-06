@@ -123,13 +123,21 @@ impl CodeDB {
     }
 
     /// Index a git repository by URL: clone/fetch, walk commits, populate DB and search indexes.
-    pub fn index_repo(&mut self, url: &str) -> Result<()> {
-        crate::indexer::index_repo(self, url)
+    ///
+    /// `max_history_depth` limits how many commits are walked per ref.
+    /// Pass `None` to index all reachable commits.
+    pub fn index_repo(
+        &mut self,
+        url: &str,
+        progress: Option<&dyn Fn(&str)>,
+        max_history_depth: Option<usize>,
+    ) -> Result<()> {
+        crate::indexer::index_repo(self, url, progress, max_history_depth)
     }
 
     /// Parse symbols for all unparsed blobs that have a supported language.
-    pub fn parse_symbols(&self) -> Result<crate::symbols::ParseStats> {
-        crate::symbols::parse_symbols(self.conn(), &self.repos_dir())
+    pub fn parse_symbols(&self, progress: Option<&dyn Fn(&str)>) -> Result<crate::symbols::ParseStats> {
+        crate::symbols::parse_symbols(self.conn(), &self.repos_dir(), progress)
     }
 
     /// Parse and translate a Sourcegraph-style query to SQL without executing.

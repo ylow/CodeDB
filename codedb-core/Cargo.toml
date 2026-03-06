@@ -10,6 +10,7 @@ tantivy-sqlite = { path = "../tantivy-sqlite" }
 rusqlite = { version = "0.32", features = ["bundled", "vtab"] }
 gix = { version = "0.70", features = ["blocking-network-client", "blocking-http-transport-curl"] }
 anyhow = "1"
+rayon = "1"
 tree-sitter = "0.26"
 tree-sitter-rust = "0.24"
 tree-sitter-python = "0.25"

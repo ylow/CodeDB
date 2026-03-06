@@ -1,4 +1,5 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
+use rayon::prelude::*;
 use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator};
 
 /// Configuration for a single language's tree-sitter grammar and queries.
@@ -699,7 +700,13 @@ pub struct ParseStats {
 pub fn parse_symbols(
     conn: &rusqlite::Connection,
     repos_dir: &std::path::Path,
+    progress: Option<&dyn Fn(&str)>,
 ) -> Result<ParseStats> {
+    let report = |msg: &str| {
+        if let Some(cb) = progress {
+            cb(msg);
+        }
+    };
     let langs = supported_languages();
     let placeholders: Vec<String> = langs
         .iter()
@@ -727,61 +734,86 @@ pub fn parse_symbols(
         });
     }
 
-    // Open all repos for reading blob content
-    let mut repos = Vec::new();
-    {
+    // Collect repo paths for parallel processing (each thread opens its own handles)
+    let repo_paths: Vec<std::path::PathBuf> = {
         let mut repo_stmt = conn.prepare("SELECT path FROM repos")?;
         let paths: Vec<String> = repo_stmt
             .query_map([], |row| row.get(0))?
             .collect::<std::result::Result<_, _>>()?;
-        for path_str in paths {
-            let full_path = if std::path::Path::new(&path_str).is_absolute() {
-                std::path::PathBuf::from(&path_str)
-            } else {
-                repos_dir.join(&path_str)
-            };
-            if let Ok(repo) = gix::open(&full_path) {
-                repos.push(repo);
-            }
-        }
-    }
+        paths
+            .iter()
+            .map(|path_str| {
+                if std::path::Path::new(path_str).is_absolute() {
+                    std::path::PathBuf::from(path_str)
+                } else {
+                    repos_dir.join(path_str)
+                }
+            })
+            .collect()
+    };
 
+    report(&format!("Parsing symbols for {} blobs...", rows.len()));
+
+    // Parallel phase: read blob content and parse with tree-sitter using rayon
+    let chunk_size = (rows.len() / rayon::current_num_threads().max(1)).clamp(64, 512);
+    let parsed_results: Vec<(i64, Option<(Vec<ExtractedSymbol>, Vec<ExtractedRef>)>)> = rows
+        .par_chunks(chunk_size)
+        .flat_map_iter(|chunk| {
+            // Each chunk opens its own repo handles (gix::Repository is Send but not Sync)
+            let repos: Vec<_> = repo_paths
+                .iter()
+                .filter_map(|p| gix::open(p).ok())
+                .collect();
+            chunk
+                .iter()
+                .map(|(blob_id, content_hash, language)| {
+                    let config = match get_config(language) {
+                        Some(c) => c,
+                        None => return (*blob_id, None),
+                    };
+                    let oid = match gix::ObjectId::from_hex(content_hash.as_bytes()) {
+                        Ok(oid) => oid,
+                        Err(_) => return (*blob_id, None),
+                    };
+                    let content = repos.iter().find_map(|repo| {
+                        repo.find_object(oid)
+                            .ok()
+                            .and_then(|obj| String::from_utf8(obj.data.clone()).ok())
+                    });
+                    match content {
+                        Some(c) => (*blob_id, extract_symbols(&c, &config)),
+                        None => (*blob_id, None),
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    report(&format!(
+        "Parsed {} blobs, inserting results...",
+        parsed_results.len()
+    ));
+
+    // Serial phase: insert parse results into SQLite
     conn.execute_batch("BEGIN TRANSACTION")?;
 
     let result = (|| -> Result<ParseStats> {
         let mut total_symbols = 0u64;
         let mut total_blobs = 0u64;
 
-        for (blob_id, content_hash, language) in &rows {
-            let config = match get_config(language) {
-                Some(c) => c,
-                None => continue,
-            };
+        for (idx, (blob_id, parse_result)) in parsed_results.iter().enumerate() {
+            if idx > 0 && idx % 2000 == 0 {
+                report(&format!(
+                    "Inserted {}/{} blobs, {} symbols so far...",
+                    idx,
+                    parsed_results.len(),
+                    total_symbols
+                ));
+            }
 
-            // Read blob content from git object store
-            let oid = gix::ObjectId::from_hex(content_hash.as_bytes())
-                .context("Invalid content_hash")?;
-            let content = repos.iter().find_map(|repo| {
-                repo.find_object(oid)
-                    .ok()
-                    .and_then(|obj| String::from_utf8(obj.data.clone()).ok())
-            });
-
-            let content = match content {
-                Some(c) => c,
-                None => {
-                    // Mark as parsed even if content not found (binary or missing)
-                    conn.execute(
-                        "UPDATE blobs SET parsed = 1 WHERE id = ?1",
-                        rusqlite::params![blob_id],
-                    )?;
-                    continue;
-                }
-            };
-
-            if let Some((symbols, refs)) = extract_symbols(&content, &config) {
+            if let Some((symbols, refs)) = parse_result {
                 let mut symbol_db_ids: Vec<i64> = Vec::with_capacity(symbols.len());
-                for sym in &symbols {
+                for sym in symbols {
                     conn.execute(
                         "INSERT INTO symbols (blob_id, parent_id, name, kind, line, col, end_line, end_col, signature, return_type, params)
                          VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -807,7 +839,7 @@ pub fn parse_symbols(
                 }
 
                 // Insert refs
-                for r in &refs {
+                for r in refs {
                     let symbol_id =
                         r.containing_symbol_index.map(|idx| symbol_db_ids[idx]);
                     conn.execute(

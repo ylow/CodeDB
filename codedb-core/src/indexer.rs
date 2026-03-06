@@ -49,8 +49,26 @@ fn get_tree_entries(
 ///
 /// This clones/fetches the repo, walks all refs and their commit histories,
 /// and populates the SQLite tables and Tantivy indexes.
-pub fn index_repo(db: &mut CodeDB, url: &str) -> Result<()> {
+///
+/// The optional `progress` callback receives status messages during indexing.
+///
+/// `max_history_depth` limits how many commits are walked per ref. If `None`,
+/// all reachable commits are indexed. When the limit is hit, a warning is
+/// reported via the progress callback but indexing continues with the
+/// truncated history.
+pub fn index_repo(
+    db: &mut CodeDB,
+    url: &str,
+    progress: Option<&dyn Fn(&str)>,
+    max_history_depth: Option<usize>,
+) -> Result<()> {
+    let report = |msg: &str| {
+        if let Some(cb) = progress {
+            cb(msg);
+        }
+    };
     // 1. Clone or fetch the repo
+    report("Cloning/fetching repository...");
     let dir_name = repo_dir_from_url(url)?;
     let repo_path = db.repos_dir().join(&dir_name);
     let repo = clone_or_fetch(url, &repo_path)
@@ -89,6 +107,7 @@ pub fn index_repo(db: &mut CodeDB, url: &str) -> Result<()> {
     let mut diff_writer = db.diff_writer()?;
 
     // 5. List all refs from gix repo
+    report("Listing refs...");
     struct RefInfo {
         name: String,
         tip_oid: gix::ObjectId,
@@ -119,15 +138,29 @@ pub fn index_repo(db: &mut CodeDB, url: &str) -> Result<()> {
     // We need to use execute_batch to start a transaction since conn() returns &Connection
     db.conn().execute_batch("BEGIN TRANSACTION")?;
 
+    report(&format!("Found {} refs.", ref_list.len()));
+
     let result = (|| -> Result<()> {
+        let mut total_new_commits = 0usize;
+        let mut total_new_blobs = 0usize;
+        let mut tree_cache: HashMap<gix::ObjectId, HashMap<String, gix::ObjectId>> = HashMap::new();
+
         // 7. For each ref
-        for ref_info in &ref_list {
+        for (ref_idx, ref_info) in ref_list.iter().enumerate() {
             // a. Walk ancestors from tip, stopping at known commits
             let mut walk_oids = vec![ref_info.tip_oid];
             let mut new_commits_data: Vec<(gix::ObjectId, CommitData)> = Vec::new();
             let mut visited = HashSet::new();
 
+            let mut depth_truncated = false;
             while let Some(oid) = walk_oids.pop() {
+                if let Some(max) = max_history_depth {
+                    if new_commits_data.len() >= max {
+                        depth_truncated = true;
+                        break;
+                    }
+                }
+
                 let oid_hex = oid.to_string();
                 if known_commits.contains(&oid_hex) || !visited.insert(oid) {
                     continue;
@@ -163,6 +196,25 @@ pub fn index_repo(db: &mut CodeDB, url: &str) -> Result<()> {
             // b. Reverse to process oldest-first
             new_commits_data.reverse();
 
+            if !new_commits_data.is_empty() {
+                report(&format!(
+                    "Ref {}/{}: {} — {} new commits",
+                    ref_idx + 1,
+                    ref_list.len(),
+                    ref_info.name,
+                    new_commits_data.len()
+                ));
+            }
+
+            if depth_truncated {
+                report(&format!(
+                    "Warning: history depth limit ({}) reached for ref {}. \
+                     Older commits will not be indexed. Use --depth to adjust.",
+                    max_history_depth.unwrap(),
+                    ref_info.name
+                ));
+            }
+
             // c. For each new commit
             for (oid, commit_data) in &new_commits_data {
                 let oid_hex = oid.to_string();
@@ -186,6 +238,11 @@ pub fn index_repo(db: &mut CodeDB, url: &str) -> Result<()> {
                     |row| row.get(0),
                 )?;
 
+                total_new_commits += 1;
+                if total_new_commits % 500 == 0 {
+                    report(&format!("Processed {} commits, {} new blobs...", total_new_commits, total_new_blobs));
+                }
+
                 // INSERT OR IGNORE into commit_parents
                 for parent_oid in &commit_data.parent_ids {
                     let parent_hex = parent_oid.to_string();
@@ -205,21 +262,36 @@ pub fn index_repo(db: &mut CodeDB, url: &str) -> Result<()> {
                 }
 
                 // Compute diff: compare parent tree to this commit's tree
-                let child_entries = get_tree_entries(&repo, commit_data.tree_id)?;
-                let parent_entries = if let Some(parent_oid) = commit_data.parent_ids.first() {
-                    // Get parent's tree
+                // Use tree cache to avoid redundant tree walks
+                if tree_cache.len() >= 32 {
+                    tree_cache.clear();
+                }
+                if !tree_cache.contains_key(&commit_data.tree_id) {
+                    let entries = get_tree_entries(&repo, commit_data.tree_id)?;
+                    tree_cache.insert(commit_data.tree_id, entries);
+                }
+                let parent_tree_id = if let Some(parent_oid) = commit_data.parent_ids.first() {
                     let parent_obj = repo.find_object(*parent_oid)?;
                     let parent_commit = parent_obj.into_commit();
                     let parent_decoded = parent_commit.decode()?;
-                    let parent_tree_id = parent_decoded.tree();
-                    get_tree_entries(&repo, parent_tree_id)?
+                    let ptid = parent_decoded.tree();
+                    if !tree_cache.contains_key(&ptid) {
+                        let entries = get_tree_entries(&repo, ptid)?;
+                        tree_cache.insert(ptid, entries);
+                    }
+                    Some(ptid)
                 } else {
-                    HashMap::new() // root commit: all files are new
+                    None
                 };
+                let child_entries = tree_cache.get(&commit_data.tree_id).unwrap();
+                let empty_tree = HashMap::new();
+                let parent_entries = parent_tree_id
+                    .and_then(|ptid| tree_cache.get(&ptid))
+                    .unwrap_or(&empty_tree);
 
                 // Find added, modified, and deleted files
                 // Added or modified: files in child but not in parent, or with different OID
-                for (path, child_blob_oid) in &child_entries {
+                for (path, child_blob_oid) in child_entries {
                     let is_changed = match parent_entries.get(path) {
                         None => true,                          // added
                         Some(parent_oid) => parent_oid != child_blob_oid, // modified
@@ -231,12 +303,15 @@ pub fn index_repo(db: &mut CodeDB, url: &str) -> Result<()> {
                     let old_blob_oid = parent_entries.get(path);
 
                     // Insert new blob
-                    let new_blob_db_id =
+                    let (new_blob_db_id, is_new) =
                         ensure_blob(db, &repo, *child_blob_oid, path, &mut code_writer)?;
+                    if is_new { total_new_blobs += 1; }
 
                     // Insert old blob if present
                     let old_blob_db_id = if let Some(&old_oid) = old_blob_oid {
-                        Some(ensure_blob(db, &repo, old_oid, path, &mut code_writer)?)
+                        let (id, is_new) = ensure_blob(db, &repo, old_oid, path, &mut code_writer)?;
+                        if is_new { total_new_blobs += 1; }
+                        Some(id)
                     } else {
                         None
                     };
@@ -266,14 +341,15 @@ pub fn index_repo(db: &mut CodeDB, url: &str) -> Result<()> {
                 }
 
                 // Handle deleted files
-                for (path, parent_blob_oid) in &parent_entries {
+                for (path, parent_blob_oid) in parent_entries {
                     if child_entries.contains_key(path) {
                         continue; // already handled above
                     }
 
                     // File was deleted
-                    let old_blob_db_id =
+                    let (old_blob_db_id, is_new) =
                         ensure_blob(db, &repo, *parent_blob_oid, path, &mut code_writer)?;
+                    if is_new { total_new_blobs += 1; }
 
                     db.conn().execute(
                         "INSERT OR IGNORE INTO diffs (commit_id, path, old_blob_id, new_blob_id)
@@ -320,11 +396,16 @@ pub fn index_repo(db: &mut CodeDB, url: &str) -> Result<()> {
                 let tip_commit = tip_obj.into_commit();
                 let tip_decoded = tip_commit.decode()?;
                 let tip_tree_id = tip_decoded.tree();
-                let tip_entries = get_tree_entries(&repo, tip_tree_id)?;
+                if !tree_cache.contains_key(&tip_tree_id) {
+                    let entries = get_tree_entries(&repo, tip_tree_id)?;
+                    tree_cache.insert(tip_tree_id, entries);
+                }
+                let tip_entries = tree_cache.get(&tip_tree_id).unwrap();
 
-                for (path, blob_oid) in &tip_entries {
-                    let blob_db_id =
+                for (path, blob_oid) in tip_entries {
+                    let (blob_db_id, is_new) =
                         ensure_blob(db, &repo, *blob_oid, path, &mut code_writer)?;
+                    if is_new { total_new_blobs += 1; }
                     db.conn().execute(
                         "INSERT OR IGNORE INTO file_revs (commit_id, path, blob_id)
                          VALUES (?1, ?2, ?3)",
@@ -341,11 +422,16 @@ pub fn index_repo(db: &mut CodeDB, url: &str) -> Result<()> {
             }
         }
 
+        report(&format!(
+            "Indexing complete: {} new commits, {} new blobs.",
+            total_new_commits, total_new_blobs
+        ));
         Ok(())
     })();
 
     match result {
         Ok(()) => {
+            report("Committing indexes...");
             // 8. Commit Tantivy writers
             code_writer.commit()?;
             diff_writer.commit()?;
@@ -376,14 +462,14 @@ struct CommitData {
 }
 
 /// Ensure a blob exists in the blobs table and Tantivy code index.
-/// Returns the blob's database ID.
+/// Returns (blob_db_id, is_new).
 fn ensure_blob(
     db: &CodeDB,
     repo: &gix::Repository,
     blob_oid: gix::ObjectId,
     path: &str,
     code_writer: &mut tantivy::IndexWriter,
-) -> Result<i64> {
+) -> Result<(i64, bool)> {
     let content_hash = blob_oid.to_string();
     let language = detect_language(path);
 
@@ -401,7 +487,8 @@ fn ensure_blob(
 
     // Index in Tantivy only for newly inserted blobs (changes() > 0 means INSERT
     // happened rather than being ignored due to UNIQUE constraint).
-    if db.conn().changes() > 0 {
+    let is_new = db.conn().changes() > 0;
+    if is_new {
         // New blob — read content and index in Tantivy
         if let Ok(obj) = repo.find_object(blob_oid) {
             if let Ok(text) = String::from_utf8(obj.data.clone()) {
@@ -416,7 +503,7 @@ fn ensure_blob(
         }
     }
 
-    Ok(blob_db_id)
+    Ok((blob_db_id, is_new))
 }
 
 /// Generate a simple diff text for indexing in Tantivy.
