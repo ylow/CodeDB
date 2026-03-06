@@ -136,22 +136,19 @@ header "Cross-reference: functions that call par_iter() (rayon parallel)"
 run_search "calls:par_iter"
 
 # ──────────────────────────────────────────────
-# Step 13: Functions returning SFrame (type info)
+# Step 13: Functions returning BatchIterator
 # ──────────────────────────────────────────────
-header "Type Info: functions returning SFrame"
-run_sql "SELECT DISTINCT fr.path || ':' || s.line AS location, s.signature
-FROM symbols s
-JOIN blobs b ON b.id = s.blob_id
-JOIN file_revs fr ON fr.blob_id = b.id
-JOIN refs r ON r.commit_id = fr.commit_id
-WHERE s.return_type LIKE '%SFrame%'
-  AND s.kind = 'function'
-  AND r.name = 'refs/heads/main'
-ORDER BY fr.path, s.line
-LIMIT 10"
+header "Type Info: functions returning BatchIterator"
+run_search "returns:BatchIterator"
 
 # ──────────────────────────────────────────────
-# Step 14: Functions taking SFrame parameters
+# Step 14: Functions returning SFrame (in query module)
+# ──────────────────────────────────────────────
+header "Type Info: functions returning SFrame in query module"
+run_search "returns:SFrame file:sframe-query count:10"
+
+# ──────────────────────────────────────────────
+# Step 15: Functions taking SFrame parameters (raw SQL)
 # ──────────────────────────────────────────────
 header "Type Info: functions with SFrame parameters"
 run_sql "SELECT DISTINCT fr.path || ':' || s.line AS location, s.params
@@ -187,25 +184,25 @@ ORDER BY calls DESC
 LIMIT 15"
 
 # ──────────────────────────────────────────────
-# Step 16: Diff search — commits that touched streaming
+# Step 17: Diff search — commits that touched streaming
 # ──────────────────────────────────────────────
 header "Diff Search: commits that touched 'streaming' in Rust files"
 run_search "type:diff file:*.rs streaming count:5"
 
 # ──────────────────────────────────────────────
-# Step 17: Commit search — recent refactors
+# Step 18: Commit search — recent refactors
 # ──────────────────────────────────────────────
 header "Commit Search: refactoring commits"
 run_search "type:commit refactor count:5"
 
 # ──────────────────────────────────────────────
-# Step 18: Commit search — by author
+# Step 19: Commit search — by author
 # ──────────────────────────────────────────────
 header "Commit Search: commits by author with 'parallel' in message"
 run_search "type:commit author:Yucheng parallel count:5"
 
 # ──────────────────────────────────────────────
-# Step 19: Incremental re-index
+# Step 20: Incremental re-index
 # ──────────────────────────────────────────────
 header "Incremental Re-index (should be fast — no new commits)"
 time $CODEDB --root "$ROOT" index "$REPO"
@@ -218,6 +215,8 @@ echo ""
 echo "Try your own queries:"
 echo "  $CODEDB --root $ROOT search \"FlexType\""
 echo "  $CODEDB --root $ROOT search \"type:symbol lang:rust SFrame\""
+echo "  $CODEDB --root $ROOT search \"returns:BatchIterator\""
+echo "  $CODEDB --root $ROOT search \"calls:groupby\""
 echo "  $CODEDB --root $ROOT search \"type:diff streaming\""
 echo "  $CODEDB --root $ROOT search \"type:commit author:Yucheng parallel\""
 echo "  $CODEDB --root $ROOT search --sql \"lang:rust file:*.rs serialize\""
