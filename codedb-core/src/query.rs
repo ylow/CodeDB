@@ -22,16 +22,20 @@ pub enum SelectType {
 #[derive(Debug, Clone, Default)]
 pub struct Filters {
     pub repo: Option<String>,
+    pub neg_repo: Option<String>,
     pub file: Option<String>,
     pub neg_file: Option<String>,
     pub lang: Option<String>,
+    pub neg_lang: Option<String>,
     pub rev: Option<String>,
     pub count: Option<u32>,
     pub case_sensitive: bool,
     pub author: Option<String>,
+    pub neg_author: Option<String>,
     pub before: Option<String>,
     pub after: Option<String>,
     pub message: Option<String>,
+    pub neg_message: Option<String>,
     pub select: Option<SelectType>,
     pub calls: Option<String>,
     pub calledby: Option<String>,
@@ -147,11 +151,23 @@ pub fn parse_query(input: &str) -> Result<ParsedQuery> {
 
         if let Some((key, value)) = rest.split_once(':') {
             match (negated, key) {
-                (false, "repo") => filters.repo = Some(value.to_string()),
+                (false, "repo") => {
+                    // Support repo:name@revision syntax
+                    if let Some((name, rev)) = value.split_once('@') {
+                        filters.repo = Some(name.to_string());
+                        filters.rev = Some(rev.to_string());
+                    } else {
+                        filters.repo = Some(value.to_string());
+                    }
+                }
+                (true, "repo") => filters.neg_repo = Some(value.to_string()),
                 (false, "file") => filters.file = Some(value.to_string()),
                 (true, "file") => filters.neg_file = Some(value.to_string()),
                 (false, "lang" | "language" | "l") => {
                     filters.lang = Some(value.to_string());
+                }
+                (true, "lang" | "language" | "l") => {
+                    filters.neg_lang = Some(value.to_string());
                 }
                 (false, "type") => {
                     search_type = match value {
@@ -176,8 +192,18 @@ pub fn parse_query(input: &str) -> Result<ParsedQuery> {
                 (false, "case") => {
                     filters.case_sensitive = value == "yes";
                 }
+                (false, "patterntype") => match value {
+                    "literal" | "keyword" => {} // default behavior
+                    other => bail!(
+                        "Unsupported pattern type '{other}'. \
+                         Only 'literal' and 'keyword' are supported"
+                    ),
+                },
                 (false, "author") => {
                     filters.author = Some(value.to_string());
+                }
+                (true, "author") => {
+                    filters.neg_author = Some(value.to_string());
                 }
                 (false, "before") => {
                     filters.before = Some(value.to_string());
@@ -187,6 +213,9 @@ pub fn parse_query(input: &str) -> Result<ParsedQuery> {
                 }
                 (false, "message") => {
                     filters.message = Some(value.to_string());
+                }
+                (true, "message") => {
+                    filters.neg_message = Some(value.to_string());
                 }
                 (false, "select") => {
                     filters.select = Some(parse_select(value)?);
@@ -301,10 +330,19 @@ fn translate_code(query: &ParsedQuery) -> Result<TranslatedQuery> {
     ];
     let mut conditions = Vec::new();
 
+    let needs_repo_join = query.filters.repo.is_some() || query.filters.neg_repo.is_some();
     if let Some(ref repo) = query.filters.repo {
         joins.push("JOIN repos rp ON rp.id = r.repo_id".to_string());
         let clause = pattern_match_clause("rp.name", repo, &mut p);
         conditions.push(format!("AND {clause}"));
+    }
+
+    if let Some(ref neg_repo) = query.filters.neg_repo {
+        if query.filters.repo.is_none() {
+            joins.push("JOIN repos rp ON rp.id = r.repo_id".to_string());
+        }
+        let clause = pattern_match_clause("rp.name", neg_repo, &mut p);
+        conditions.push(format!("AND NOT ({clause})"));
     }
 
     if let Some(ref file) = query.filters.file {
@@ -322,6 +360,11 @@ fn translate_code(query: &ParsedQuery) -> Result<TranslatedQuery> {
         conditions.push(format!("AND b.language = {placeholder}"));
     }
 
+    if let Some(ref neg_lang) = query.filters.neg_lang {
+        let placeholder = p.add(neg_lang.clone());
+        conditions.push(format!("AND b.language != {placeholder}"));
+    }
+
     // rev: filter (defaults to refs/heads/main)
     let rev = query.filters.rev.clone().unwrap_or_else(|| "main".to_string());
     let rev_ref = if rev.starts_with("refs/") {
@@ -337,7 +380,7 @@ fn translate_code(query: &ParsedQuery) -> Result<TranslatedQuery> {
     // select: modifier changes output
     let (select_clause, group_by, order_by) = match &query.filters.select {
         Some(SelectType::Repo) => {
-            if query.filters.repo.is_none() {
+            if !needs_repo_join {
                 joins.push("JOIN repos rp ON rp.id = r.repo_id".to_string());
             }
             (
@@ -409,6 +452,14 @@ fn translate_diff(query: &ParsedQuery) -> Result<TranslatedQuery> {
         conditions.push(format!("AND {clause}"));
     }
 
+    if let Some(ref neg_repo) = query.filters.neg_repo {
+        if query.filters.repo.is_none() {
+            joins.push("JOIN repos rp ON rp.id = c.repo_id".to_string());
+        }
+        let clause = pattern_match_clause("rp.name", neg_repo, &mut p);
+        conditions.push(format!("AND NOT ({clause})"));
+    }
+
     if let Some(ref file) = query.filters.file {
         let clause = pattern_match_clause("d.path", file, &mut p);
         conditions.push(format!("AND {clause}"));
@@ -422,6 +473,11 @@ fn translate_diff(query: &ParsedQuery) -> Result<TranslatedQuery> {
     if let Some(ref author) = query.filters.author {
         let clause = pattern_match_clause("c.author", author, &mut p);
         conditions.push(format!("AND {clause}"));
+    }
+
+    if let Some(ref neg_author) = query.filters.neg_author {
+        let clause = pattern_match_clause("c.author", neg_author, &mut p);
+        conditions.push(format!("AND NOT ({clause})"));
     }
 
     if let Some(ref before) = query.filters.before {
@@ -490,6 +546,11 @@ fn translate_commit(query: &ParsedQuery) -> Result<TranslatedQuery> {
         conditions.push(format!("AND {clause}"));
     }
 
+    if let Some(ref neg_message) = query.filters.neg_message {
+        let clause = pattern_match_clause("c.message", neg_message, &mut p);
+        conditions.push(format!("AND NOT ({clause})"));
+    }
+
     let mut joins = Vec::new();
 
     if let Some(ref repo) = query.filters.repo {
@@ -498,9 +559,22 @@ fn translate_commit(query: &ParsedQuery) -> Result<TranslatedQuery> {
         conditions.push(format!("AND {clause}"));
     }
 
+    if let Some(ref neg_repo) = query.filters.neg_repo {
+        if query.filters.repo.is_none() {
+            joins.push("JOIN repos rp ON rp.id = c.repo_id".to_string());
+        }
+        let clause = pattern_match_clause("rp.name", neg_repo, &mut p);
+        conditions.push(format!("AND NOT ({clause})"));
+    }
+
     if let Some(ref author) = query.filters.author {
         let clause = pattern_match_clause("c.author", author, &mut p);
         conditions.push(format!("AND {clause}"));
+    }
+
+    if let Some(ref neg_author) = query.filters.neg_author {
+        let clause = pattern_match_clause("c.author", neg_author, &mut p);
+        conditions.push(format!("AND NOT ({clause})"));
     }
 
     if let Some(ref before) = query.filters.before {
@@ -570,6 +644,14 @@ fn translate_symbol(query: &ParsedQuery) -> Result<TranslatedQuery> {
         conditions.push(format!("AND {clause}"));
     }
 
+    if let Some(ref neg_repo) = query.filters.neg_repo {
+        if query.filters.repo.is_none() {
+            joins.push("JOIN repos rp ON rp.id = r.repo_id".to_string());
+        }
+        let clause = pattern_match_clause("rp.name", neg_repo, &mut p);
+        conditions.push(format!("AND NOT ({clause})"));
+    }
+
     if let Some(ref file) = query.filters.file {
         let clause = pattern_match_clause("fr.path", file, &mut p);
         conditions.push(format!("AND {clause}"));
@@ -583,6 +665,11 @@ fn translate_symbol(query: &ParsedQuery) -> Result<TranslatedQuery> {
     if let Some(ref lang) = query.filters.lang {
         let placeholder = p.add(lang.clone());
         conditions.push(format!("AND b.language = {placeholder}"));
+    }
+
+    if let Some(ref neg_lang) = query.filters.neg_lang {
+        let placeholder = p.add(neg_lang.clone());
+        conditions.push(format!("AND b.language != {placeholder}"));
     }
 
     if let Some(SelectType::SymbolKind(ref kind)) = query.filters.select {
@@ -669,6 +756,14 @@ fn translate_callers(query: &ParsedQuery) -> Result<TranslatedQuery> {
         conditions.push(format!("AND {clause}"));
     }
 
+    if let Some(ref neg_repo) = query.filters.neg_repo {
+        if query.filters.repo.is_none() {
+            joins.push("JOIN repos rp ON rp.id = r.repo_id".to_string());
+        }
+        let clause = pattern_match_clause("rp.name", neg_repo, &mut p);
+        conditions.push(format!("AND NOT ({clause})"));
+    }
+
     if let Some(ref file) = query.filters.file {
         let clause = pattern_match_clause("fr.path", file, &mut p);
         conditions.push(format!("AND {clause}"));
@@ -682,6 +777,11 @@ fn translate_callers(query: &ParsedQuery) -> Result<TranslatedQuery> {
     if let Some(ref lang) = query.filters.lang {
         let placeholder = p.add(lang.clone());
         conditions.push(format!("AND b.language = {placeholder}"));
+    }
+
+    if let Some(ref neg_lang) = query.filters.neg_lang {
+        let placeholder = p.add(neg_lang.clone());
+        conditions.push(format!("AND b.language != {placeholder}"));
     }
 
     // rev: filter
@@ -743,6 +843,14 @@ fn translate_callees(query: &ParsedQuery) -> Result<TranslatedQuery> {
         conditions.push(format!("AND {clause}"));
     }
 
+    if let Some(ref neg_repo) = query.filters.neg_repo {
+        if query.filters.repo.is_none() {
+            joins.push("JOIN repos rp ON rp.id = r.repo_id".to_string());
+        }
+        let clause = pattern_match_clause("rp.name", neg_repo, &mut p);
+        conditions.push(format!("AND NOT ({clause})"));
+    }
+
     if let Some(ref file) = query.filters.file {
         let clause = pattern_match_clause("fr.path", file, &mut p);
         conditions.push(format!("AND {clause}"));
@@ -756,6 +864,11 @@ fn translate_callees(query: &ParsedQuery) -> Result<TranslatedQuery> {
     if let Some(ref lang) = query.filters.lang {
         let placeholder = p.add(lang.clone());
         conditions.push(format!("AND b.language = {placeholder}"));
+    }
+
+    if let Some(ref neg_lang) = query.filters.neg_lang {
+        let placeholder = p.add(neg_lang.clone());
+        conditions.push(format!("AND b.language != {placeholder}"));
     }
 
     // rev: filter
@@ -930,7 +1043,8 @@ mod tests {
 
     #[test]
     fn test_parse_negation_unsupported() {
-        let err = parse_query("-repo:foo bar").unwrap_err();
+        // Filters that don't support negation should still error
+        let err = parse_query("-count:5 bar").unwrap_err();
         assert!(err.to_string().contains("Negation not supported"), "got: {err}");
     }
 
@@ -1303,5 +1417,140 @@ mod tests {
         let t = translate(&q).unwrap();
         assert!(t.sql.contains("lower(fr.path) GLOB"), "sql: {}", t.sql);
         assert!(t.params.iter().any(|p| p == "*.rs"), "params: {:?}", t.params);
+    }
+
+    // --- @revision syntax tests ---
+
+    #[test]
+    fn test_parse_repo_at_revision() {
+        let q = parse_query("repo:myrepo@develop foo").unwrap();
+        assert_eq!(q.filters.repo.as_deref(), Some("myrepo"));
+        assert_eq!(q.filters.rev.as_deref(), Some("develop"));
+    }
+
+    #[test]
+    fn test_parse_repo_at_revision_full_ref() {
+        let q = parse_query("repo:myrepo@refs/tags/v1.0 foo").unwrap();
+        assert_eq!(q.filters.repo.as_deref(), Some("myrepo"));
+        assert_eq!(q.filters.rev.as_deref(), Some("refs/tags/v1.0"));
+    }
+
+    #[test]
+    fn test_parse_repo_without_revision() {
+        let q = parse_query("repo:myrepo foo").unwrap();
+        assert_eq!(q.filters.repo.as_deref(), Some("myrepo"));
+        assert!(q.filters.rev.is_none());
+    }
+
+    #[test]
+    fn test_translate_repo_at_revision() {
+        let q = parse_query("repo:myrepo@develop foo").unwrap();
+        let t = translate(&q).unwrap();
+        assert!(t.params.iter().any(|p| p.contains("myrepo")), "params: {:?}", t.params);
+        assert!(t.params.iter().any(|p| p == "refs/heads/develop"), "params: {:?}", t.params);
+    }
+
+    // --- negated filter tests ---
+
+    #[test]
+    fn test_parse_neg_repo() {
+        let q = parse_query("-repo:unwanted foo").unwrap();
+        assert_eq!(q.filters.neg_repo.as_deref(), Some("unwanted"));
+        assert!(q.filters.repo.is_none());
+    }
+
+    #[test]
+    fn test_parse_neg_lang() {
+        let q = parse_query("-lang:python foo").unwrap();
+        assert_eq!(q.filters.neg_lang.as_deref(), Some("python"));
+    }
+
+    #[test]
+    fn test_parse_neg_author() {
+        let q = parse_query("type:commit -author:bot refactor").unwrap();
+        assert_eq!(q.filters.neg_author.as_deref(), Some("bot"));
+    }
+
+    #[test]
+    fn test_parse_neg_message() {
+        let q = parse_query("type:commit -message:WIP author:alice").unwrap();
+        assert_eq!(q.filters.neg_message.as_deref(), Some("WIP"));
+    }
+
+    #[test]
+    fn test_translate_neg_repo_code() {
+        let q = parse_query("-repo:unwanted foo").unwrap();
+        let t = translate(&q).unwrap();
+        assert!(t.sql.contains("repos rp"), "sql: {}", t.sql);
+        assert!(t.sql.contains("NOT"), "sql: {}", t.sql);
+        assert!(t.params.iter().any(|p| p.contains("unwanted")), "params: {:?}", t.params);
+    }
+
+    #[test]
+    fn test_translate_neg_lang_code() {
+        let q = parse_query("-lang:python foo").unwrap();
+        let t = translate(&q).unwrap();
+        assert!(t.sql.contains("b.language !="), "sql: {}", t.sql);
+        assert!(t.params.iter().any(|p| p == "python"), "params: {:?}", t.params);
+    }
+
+    #[test]
+    fn test_translate_neg_author_diff() {
+        let q = parse_query("type:diff -author:bot streaming").unwrap();
+        let t = translate(&q).unwrap();
+        assert!(t.sql.contains("NOT"), "sql: {}", t.sql);
+        assert!(t.params.iter().any(|p| p.contains("bot")), "params: {:?}", t.params);
+    }
+
+    #[test]
+    fn test_translate_neg_author_commit() {
+        let q = parse_query("type:commit -author:bot refactor").unwrap();
+        let t = translate(&q).unwrap();
+        assert!(t.sql.contains("NOT"), "sql: {}", t.sql);
+        assert!(t.params.iter().any(|p| p.contains("bot")), "params: {:?}", t.params);
+    }
+
+    #[test]
+    fn test_translate_neg_message_commit() {
+        let q = parse_query("type:commit -message:WIP author:alice").unwrap();
+        let t = translate(&q).unwrap();
+        assert!(t.sql.contains("NOT"), "sql: {}", t.sql);
+        assert!(t.params.iter().any(|p| p.contains("WIP")), "params: {:?}", t.params);
+    }
+
+    #[test]
+    fn test_translate_neg_lang_symbol() {
+        let q = parse_query("type:symbol -lang:python SFrame").unwrap();
+        let t = translate(&q).unwrap();
+        assert!(t.sql.contains("b.language !="), "sql: {}", t.sql);
+    }
+
+    #[test]
+    fn test_translate_both_repo_and_neg_repo() {
+        // Both repo: and -repo: — only one JOIN
+        let q = parse_query("repo:myorg -repo:test foo").unwrap();
+        let t = translate(&q).unwrap();
+        let join_count = t.sql.matches("repos rp").count();
+        assert_eq!(join_count, 1, "should have exactly one repos join, sql: {}", t.sql);
+    }
+
+    // --- patterntype: tests ---
+
+    #[test]
+    fn test_parse_patterntype_literal() {
+        let q = parse_query("patterntype:literal foo").unwrap();
+        assert_eq!(q.search_pattern, "foo");
+    }
+
+    #[test]
+    fn test_parse_patterntype_keyword() {
+        let q = parse_query("patterntype:keyword foo").unwrap();
+        assert_eq!(q.search_pattern, "foo");
+    }
+
+    #[test]
+    fn test_parse_patterntype_unsupported() {
+        let err = parse_query("patterntype:regexp foo").unwrap_err();
+        assert!(err.to_string().contains("Unsupported pattern type"), "got: {err}");
     }
 }

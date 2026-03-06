@@ -73,17 +73,17 @@ Bare words are search terms; filters use `key:value` syntax.
 
 | Filter | Description | Example |
 |--------|-------------|---------|
-| `repo:` | Filter by repository name | `repo:SFrameRust` |
+| `repo:` / `-repo:` | Include / exclude by repository name; supports `@rev` | `repo:SFrame@main` |
 | `file:` / `-file:` | Include / exclude file paths | `file:*.rs -file:test` |
-| `lang:` or `l:` | Filter by language | `lang:rust` |
+| `lang:` / `-lang:` | Include / exclude by language | `lang:rust` / `-lang:python` |
 | `type:` | Search type: `code`, `diff`, `commit`, `symbol` | `type:symbol` |
 | `rev:` | Branch or ref (default: `refs/heads/main`) | `rev:develop` |
 | `select:` | Output format: `repo`, `file`, `symbol`, `symbol.KIND` | `select:symbol.function` |
 | `count:` | Max results (default: 20) | `count:50` |
 | `case:` | Case sensitivity (`yes`/`no`) | `case:yes` |
-| `author:` | Commit/diff author | `author:Yucheng` |
+| `author:` / `-author:` | Include / exclude commit/diff author | `author:Yucheng` / `-author:bot` |
 | `before:` / `after:` | Date range for commits/diffs | `after:2024-01-01` |
-| `message:` | Commit message filter | `message:refactor` |
+| `message:` / `-message:` | Include / exclude by commit message | `message:refactor` / `-message:WIP` |
 | `calls:` | Find functions that call a given function | `calls:groupby` |
 | `calledby:` | Find functions called by a given function | `calledby:groupby` |
 | `returns:` | Find functions returning a given type | `returns:SFrame` |
@@ -108,9 +108,12 @@ The core query experience is compatible:
 
 - **Bare search terms** — `error handling` searches file contents, just like Sourcegraph.
 - **Quoted phrases** — `"parse error"` matches the exact phrase.
-- **Filters** — `repo:`, `file:`, `-file:`, `lang:` (alias `l:`), `rev:`, `case:`,
+- **Filters** — `repo:`, `file:`, `lang:` (alias `l:`), `rev:`, `case:`,
   `type:` (code/diff/commit/symbol), `select:`, `count:`, `author:`,
   `before:`, `after:`, `message:` all work as expected.
+- **Negation** — `-file:`, `-repo:`, `-lang:`, `-author:`, `-message:` all supported.
+- **`@revision`** — `repo:foo@branch` works, equivalent to `repo:foo rev:branch`.
+- **`patterntype:literal`** and **`patterntype:keyword`** — accepted (default behavior).
 
 ### What's different
 
@@ -118,11 +121,11 @@ The core query experience is compatible:
 |------|------------|--------|
 | **Scope** | Searches across thousands of repositories on a hosted instance. Has `fork:`, `archived:`, `visibility:`, `repogroup:`, `repo:has.file()`, `repo:has.path()`, `file:has.owner()` for filtering across a large corpus. | Designed for one or a few locally-indexed repos. Repository-level metadata filters (`fork:`, `archived:`, `visibility:`, `repogroup:`, `repo:has.*`, `file:has.*`) are not supported — they don't apply at this scale. |
 | **Regex** | Supports `/regex/` patterns and `patterntype:regexp`. | No regex in the query language. Patterns match as substrings (or GLOB wildcards with `*`/`?`). For regex needs, drop to raw SQL where Tantivy supports regex mode. |
-| **Boolean operators** | Full `AND`, `OR`, `NOT` with parenthesized grouping. | All terms are implicitly AND'ed. No `OR`, `NOT`, or parentheses. Only `-file:` negation is supported. |
+| **Boolean operators** | Full `AND`, `OR`, `NOT` with parenthesized grouping. | All terms are implicitly AND'ed. No `OR`, `NOT`, or parentheses. Negation supported for filters (`-file:`, `-repo:`, `-lang:`, `-author:`, `-message:`). |
 | **Structural search** | `type:structural` with [Comby](https://comby.dev/) patterns for syntax-aware matching (e.g., `fmt.Sprintf(:[args])`). | Not supported. CodeDB addresses similar use cases through symbol extraction and cross-reference queries instead. |
 | **Code intelligence** | Separate LSIF/SCIP-based precise code navigation (go-to-definition, find-references). Not part of the query language. | Built into the query language via `calls:`, `calledby:`, and `returns:` filters. Uses tree-sitter extraction — less precise than LSIF/SCIP but requires no separate indexing pipeline. |
-| **`patterntype:`** | Controls interpretation: `literal`, `regexp`, `keyword`, `structural`. | Not supported. Patterns are always literal/substring (GLOB if wildcards present). |
-| **`@revision` syntax** | `repo:foo@branch` to pin a revision. | Use `rev:branch` as a separate filter instead. |
+| **`patterntype:`** | Controls interpretation: `literal`, `regexp`, `keyword`, `structural`. | `literal` and `keyword` accepted. `regexp` and `structural` not supported. |
+| **`@revision` syntax** | `repo:foo@branch` to pin a revision. | Supported — splits into `repo:foo` + `rev:branch`. |
 | **`timeout:`, `stable:`** | Query execution controls. | Not supported (queries run locally and complete fast). |
 
 ### Porting queries from Sourcegraph
@@ -136,7 +139,7 @@ Most queries port directly:
 | `repo:myorg/myrepo error` | `repo:myrepo error` (substring match on repo name) |
 | `type:diff author:alice fix` | `type:diff author:alice fix` (identical) |
 | `type:symbol lang:rust Iterator` | `type:symbol lang:rust Iterator` (identical) |
-| `repo:foo@develop query` | `repo:foo rev:develop query` (use `rev:` instead of `@`) |
+| `repo:foo@develop query` | `repo:foo@develop query` (identical — `@` syntax supported) |
 | `patterntype:regexp err\d+` | Not directly supported — use `codedb sql` with Tantivy regex mode |
 | `(foo OR bar) lang:go` | Run as two separate queries, or use raw SQL |
 
