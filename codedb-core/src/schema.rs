@@ -1,7 +1,27 @@
 use rusqlite::Connection;
 
 pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(SCHEMA_SQL)
+    conn.execute_batch(SCHEMA_SQL)?;
+    // Migration: add type-info columns if upgrading from an older schema
+    migrate_add_type_info(conn)?;
+    Ok(())
+}
+
+fn migrate_add_type_info(conn: &Connection) -> rusqlite::Result<()> {
+    let has_col: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info('symbols') WHERE name='signature'",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_col {
+        conn.execute_batch(
+            "ALTER TABLE symbols ADD COLUMN signature TEXT;
+             ALTER TABLE symbols ADD COLUMN return_type TEXT;
+             ALTER TABLE symbols ADD COLUMN params TEXT;
+             UPDATE blobs SET parsed = 0 WHERE language IS NOT NULL;",
+        )?;
+    }
+    Ok(())
 }
 
 const SCHEMA_SQL: &str = "
@@ -59,15 +79,18 @@ CREATE TABLE IF NOT EXISTS diffs (
 );
 
 CREATE TABLE IF NOT EXISTS symbols (
-    id        INTEGER PRIMARY KEY,
-    blob_id   INTEGER NOT NULL REFERENCES blobs(id),
-    parent_id INTEGER REFERENCES symbols(id),
-    name      TEXT NOT NULL,
-    kind      TEXT NOT NULL,
-    line      INTEGER NOT NULL,
-    col       INTEGER NOT NULL,
-    end_line  INTEGER,
-    end_col   INTEGER
+    id          INTEGER PRIMARY KEY,
+    blob_id     INTEGER NOT NULL REFERENCES blobs(id),
+    parent_id   INTEGER REFERENCES symbols(id),
+    name        TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    line        INTEGER NOT NULL,
+    col         INTEGER NOT NULL,
+    end_line    INTEGER,
+    end_col     INTEGER,
+    signature   TEXT,
+    return_type TEXT,
+    params      TEXT
 );
 
 CREATE TABLE IF NOT EXISTS symbol_refs (

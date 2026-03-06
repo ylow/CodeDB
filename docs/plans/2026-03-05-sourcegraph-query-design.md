@@ -23,6 +23,8 @@ Supports all four search types: code, diff, commit, and symbol.
 | `after:` | `after:2025-06-01` | `commits.timestamp` (diff/commit types) |
 | `message:` | `message:refactor` | `commits.message` (commit type) |
 | `select:` | `select:repo\|file\|symbol.function` | Changes output columns/grouping |
+| `calls:` | `calls:groupby` | Find functions that call `groupby` (via `symbol_refs`) |
+| `calledby:` | `calledby:groupby` | Find what `groupby` calls (via `symbol_refs`) |
 
 **Not supported:** `fork:`, `archived:`, `visibility:`, `repo:has.*` predicates,
 `file:has.owner()`, structural search, `@revision` syntax.
@@ -144,6 +146,39 @@ WHERE s.name LIKE ?1
   AND r.name = ?5                           -- if rev:
 ORDER BY fr.path, s.line
 LIMIT ?6
+```
+
+### Callers Search (`calls:`)
+
+```sql
+SELECT DISTINCT fr.path, s.name, s.kind, s.line
+FROM symbol_refs sr
+JOIN symbols s ON s.id = sr.symbol_id
+JOIN blobs b ON b.id = sr.blob_id
+JOIN file_revs fr ON fr.blob_id = b.id
+JOIN refs r ON r.commit_id = fr.commit_id
+WHERE sr.ref_name LIKE ?1                    -- calls: target
+  AND sr.kind = 'call'
+  AND s.kind = 'function'
+  AND r.name = ?2                            -- rev: (default refs/heads/main)
+ORDER BY fr.path, s.line
+LIMIT ?3
+```
+
+### Callees Search (`calledby:`)
+
+```sql
+SELECT DISTINCT fr.path, sr.ref_name AS name, sr.kind, sr.line
+FROM symbols s
+JOIN symbol_refs sr ON sr.symbol_id = s.id AND sr.blob_id = s.blob_id
+JOIN blobs b ON b.id = sr.blob_id
+JOIN file_revs fr ON fr.blob_id = b.id
+JOIN refs r ON r.commit_id = fr.commit_id
+WHERE s.name LIKE ?1                         -- calledby: source function
+  AND s.kind = 'function'
+  AND r.name = ?2                            -- rev: (default refs/heads/main)
+ORDER BY sr.line
+LIMIT ?3
 ```
 
 ### `select:` Modifier

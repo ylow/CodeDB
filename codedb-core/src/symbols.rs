@@ -3,6 +3,7 @@ use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator};
 
 /// Configuration for a single language's tree-sitter grammar and queries.
 pub(crate) struct LanguageConfig {
+    pub name: &'static str,
     pub language: Language,
     pub def_query: &'static str,
     pub ref_query: &'static str,
@@ -21,6 +22,12 @@ pub(crate) struct ExtractedSymbol {
     pub end_byte: usize,
     /// Index into the symbols vec of the parent symbol, if this symbol is nested.
     pub parent_index: Option<usize>,
+    /// Full signature text (e.g., `fn hello(x: i32) -> String`).
+    pub signature: Option<String>,
+    /// Return type for functions (e.g., `String`, `Option<i32>`).
+    pub return_type: Option<String>,
+    /// Parameter list text (e.g., `x: i32, y: &str`).
+    pub params: Option<String>,
 }
 
 /// A reference (call site) extracted from source code.
@@ -76,6 +83,7 @@ pub(crate) fn get_config(language: &str) -> Option<LanguageConfig> {
 
 fn rust_config() -> LanguageConfig {
     LanguageConfig {
+        name: "rust",
         language: tree_sitter_rust::LANGUAGE.into(),
         def_query: "
             (function_item name: (identifier) @name) @def
@@ -98,6 +106,7 @@ fn rust_config() -> LanguageConfig {
 
 fn python_config() -> LanguageConfig {
     LanguageConfig {
+        name: "python",
         language: tree_sitter_python::LANGUAGE.into(),
         def_query: "
             (function_definition name: (identifier) @name) @def
@@ -112,6 +121,7 @@ fn python_config() -> LanguageConfig {
 
 fn javascript_config() -> LanguageConfig {
     LanguageConfig {
+        name: "javascript",
         language: tree_sitter_javascript::LANGUAGE.into(),
         def_query: "
             (function_declaration name: (identifier) @name) @def
@@ -127,10 +137,11 @@ fn javascript_config() -> LanguageConfig {
 
 fn typescript_config() -> LanguageConfig {
     LanguageConfig {
+        name: "typescript",
         language: tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         def_query: "
             (function_declaration name: (identifier) @name) @def
-            (class_declaration name: (identifier) @name) @def
+            (class_declaration name: (type_identifier) @name) @def
             (method_definition name: (property_identifier) @name) @def
             (interface_declaration name: (type_identifier) @name) @def
             (enum_declaration name: (identifier) @name) @def
@@ -145,10 +156,11 @@ fn typescript_config() -> LanguageConfig {
 
 fn tsx_config() -> LanguageConfig {
     LanguageConfig {
+        name: "tsx",
         language: tree_sitter_typescript::LANGUAGE_TSX.into(),
         def_query: "
             (function_declaration name: (identifier) @name) @def
-            (class_declaration name: (identifier) @name) @def
+            (class_declaration name: (type_identifier) @name) @def
             (method_definition name: (property_identifier) @name) @def
             (interface_declaration name: (type_identifier) @name) @def
             (enum_declaration name: (identifier) @name) @def
@@ -163,6 +175,7 @@ fn tsx_config() -> LanguageConfig {
 
 fn go_config() -> LanguageConfig {
     LanguageConfig {
+        name: "go",
         language: tree_sitter_go::LANGUAGE.into(),
         def_query: "
             (function_declaration name: (identifier) @name) @def
@@ -178,6 +191,7 @@ fn go_config() -> LanguageConfig {
 
 fn c_config() -> LanguageConfig {
     LanguageConfig {
+        name: "c",
         language: tree_sitter_c::LANGUAGE.into(),
         def_query: "
             (function_definition declarator: (function_declarator declarator: (identifier) @name)) @def
@@ -192,6 +206,7 @@ fn c_config() -> LanguageConfig {
 
 fn cpp_config() -> LanguageConfig {
     LanguageConfig {
+        name: "cpp",
         language: tree_sitter_cpp::LANGUAGE.into(),
         def_query: "
             (function_definition declarator: (function_declarator declarator: (identifier) @name)) @def
@@ -286,6 +301,8 @@ pub(crate) fn extract_symbols(
             if let (Some(name), Some(node)) = (name_text, def_node) {
                 let start = node.start_position();
                 let end = node.end_position();
+                let (signature, return_type, params) =
+                    extract_type_info(&node, source, config.name);
                 symbols.push(ExtractedSymbol {
                     name: name.to_string(),
                     kind: normalize_kind(node.kind()),
@@ -296,6 +313,9 @@ pub(crate) fn extract_symbols(
                     start_byte: node.start_byte(),
                     end_byte: node.end_byte(),
                     parent_index: None, // filled in below
+                    signature,
+                    return_type,
+                    params,
                 });
             }
         }
@@ -380,6 +400,289 @@ fn find_containing_symbol(symbols: &[ExtractedSymbol], byte_offset: usize) -> Op
         }
     }
     best
+}
+
+// ---------------------------------------------------------------------------
+// Type information extraction
+// ---------------------------------------------------------------------------
+
+/// Collapse consecutive whitespace (including newlines) into single spaces.
+fn collapse_whitespace(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut prev_ws = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            if !prev_ws {
+                result.push(' ');
+                prev_ws = true;
+            }
+        } else {
+            result.push(c);
+            prev_ws = false;
+        }
+    }
+    result.trim().to_string()
+}
+
+/// Check if a node kind represents a function-like definition.
+fn is_function_like(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function_item"
+            | "function_definition"
+            | "function_declaration"
+            | "method_definition"
+            | "method_declaration"
+    )
+}
+
+/// Find the start byte of the first "body" node, searching up to `depth` levels.
+fn find_body_start(node: &tree_sitter::Node, depth: usize) -> Option<usize> {
+    const BODY_KINDS: &[&str] = &[
+        "block",
+        "statement_block",
+        "compound_statement",
+        "field_declaration_list",
+        "declaration_list",
+        "class_body",
+        "interface_body",
+        "enum_variant_list",
+    ];
+    if depth == 0 {
+        return None;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if BODY_KINDS.contains(&child.kind()) {
+            return Some(child.start_byte());
+        }
+    }
+    let mut cursor2 = node.walk();
+    for child in node.children(&mut cursor2) {
+        if let Some(start) = find_body_start(&child, depth - 1) {
+            return Some(start);
+        }
+    }
+    None
+}
+
+/// Extract the signature text from a definition node (everything before the body).
+fn extract_signature(node: &tree_sitter::Node, source: &str) -> String {
+    let body_start = find_body_start(node, 3);
+    let sig_end = body_start.unwrap_or_else(|| {
+        // Fallback: find first `{` in the node text
+        let text = &source[node.byte_range()];
+        text.find('{')
+            .map(|pos| node.start_byte() + pos)
+            .unwrap_or(node.end_byte())
+    });
+    let sig = &source[node.start_byte()..sig_end];
+    collapse_whitespace(sig.trim())
+}
+
+/// Extract type information (signature, return_type, params) from a def node.
+fn extract_type_info(
+    node: &tree_sitter::Node,
+    source: &str,
+    language: &str,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let signature = Some(extract_signature(node, source));
+
+    if !is_function_like(node.kind()) {
+        return (signature, None, None);
+    }
+
+    let (return_type, params) = match language {
+        "rust" => extract_rust_fn_types(node, source),
+        "python" => extract_python_fn_types(node, source),
+        "go" => extract_go_fn_types(node, source),
+        "typescript" | "tsx" => extract_ts_fn_types(node, source),
+        "javascript" => extract_js_fn_types(node, source),
+        "c" | "cpp" => extract_c_fn_types(node, source),
+        _ => (None, None),
+    };
+
+    (signature, return_type, params)
+}
+
+/// Extract parameter list text: find the param list child, strip outer parens.
+fn extract_param_list_text(
+    node: &tree_sitter::Node,
+    source: &str,
+    param_list_kind: &str,
+) -> Option<String> {
+    let mut cursor = node.walk();
+    let param_node = node
+        .children(&mut cursor)
+        .find(|c| c.kind() == param_list_kind)?;
+    let text = source[param_node.byte_range()].trim();
+    let inner = text
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .unwrap_or(text)
+        .trim();
+    Some(collapse_whitespace(inner))
+}
+
+/// Find the return type by looking for a type node after `->` token.
+fn find_return_type_after_arrow(node: &tree_sitter::Node, source: &str) -> Option<String> {
+    let mut cursor = node.walk();
+    let mut saw_arrow = false;
+    for child in node.children(&mut cursor) {
+        if child.kind() == "->" {
+            saw_arrow = true;
+            continue;
+        }
+        if saw_arrow && child.is_named() {
+            return Some(source[child.byte_range()].to_string());
+        }
+    }
+    None
+}
+
+fn extract_rust_fn_types(
+    node: &tree_sitter::Node,
+    source: &str,
+) -> (Option<String>, Option<String>) {
+    let return_type = find_return_type_after_arrow(node, source);
+    let params = extract_param_list_text(node, source, "parameters");
+    (return_type, params)
+}
+
+fn extract_python_fn_types(
+    node: &tree_sitter::Node,
+    source: &str,
+) -> (Option<String>, Option<String>) {
+    let return_type = find_return_type_after_arrow(node, source);
+    let params = extract_param_list_text(node, source, "parameters");
+    (return_type, params)
+}
+
+fn extract_go_fn_types(
+    node: &tree_sitter::Node,
+    source: &str,
+) -> (Option<String>, Option<String>) {
+    let mut cursor = node.walk();
+    let children: Vec<_> = node.children(&mut cursor).collect();
+
+    // Find the name (identifier for functions, field_identifier for methods)
+    let name_pos = children
+        .iter()
+        .position(|c| c.kind() == "identifier" || c.kind() == "field_identifier");
+
+    // Params: parameter_list immediately after the name
+    let params = name_pos.and_then(|np| {
+        children[np + 1..]
+            .iter()
+            .find(|c| c.kind() == "parameter_list")
+            .map(|param_node| {
+                let text = source[param_node.byte_range()].trim();
+                let inner = text
+                    .strip_prefix('(')
+                    .and_then(|s| s.strip_suffix(')'))
+                    .unwrap_or(text)
+                    .trim();
+                collapse_whitespace(inner)
+            })
+    });
+
+    // Return type: text between params end and block start
+    let return_type = name_pos.and_then(|np| {
+        let params_node = children[np + 1..]
+            .iter()
+            .find(|c| c.kind() == "parameter_list")?;
+        let params_end = params_node.end_byte();
+        let block_start = children
+            .iter()
+            .find(|c| c.kind() == "block")
+            .map(|c| c.start_byte())
+            .unwrap_or(node.end_byte());
+        let ret = source[params_end..block_start].trim();
+        if ret.is_empty() {
+            None
+        } else {
+            Some(ret.to_string())
+        }
+    });
+
+    (return_type, params)
+}
+
+fn extract_ts_fn_types(
+    node: &tree_sitter::Node,
+    source: &str,
+) -> (Option<String>, Option<String>) {
+    let params = extract_param_list_text(node, source, "formal_parameters");
+
+    // Return type: type_annotation directly on the function node (not inside params)
+    let return_type = {
+        let mut cursor = node.walk();
+        let result = node
+            .children(&mut cursor)
+            .find(|c| c.kind() == "type_annotation")
+            .map(|ta| {
+                let text = source[ta.byte_range()].trim();
+                text.strip_prefix(':').unwrap_or(text).trim().to_string()
+            });
+        result
+    };
+
+    (return_type, params)
+}
+
+fn extract_js_fn_types(
+    node: &tree_sitter::Node,
+    source: &str,
+) -> (Option<String>, Option<String>) {
+    let params = extract_param_list_text(node, source, "formal_parameters");
+    (None, params)
+}
+
+fn extract_c_fn_types(
+    node: &tree_sitter::Node,
+    source: &str,
+) -> (Option<String>, Option<String>) {
+    let mut cursor = node.walk();
+    let children: Vec<_> = node.children(&mut cursor).collect();
+
+    let decl_pos = children
+        .iter()
+        .position(|c| c.kind() == "function_declarator");
+
+    // Return type: everything before function_declarator
+    let return_type = decl_pos.and_then(|dp| {
+        if dp == 0 {
+            return None;
+        }
+        let ret_end = children[dp].start_byte();
+        let ret = source[node.start_byte()..ret_end].trim();
+        if ret.is_empty() {
+            None
+        } else {
+            Some(ret.to_string())
+        }
+    });
+
+    // Params: parameter_list inside function_declarator
+    let params = decl_pos.and_then(|dp| {
+        let decl = &children[dp];
+        let mut dcursor = decl.walk();
+        let result = decl
+            .children(&mut dcursor)
+            .find(|c| c.kind() == "parameter_list")
+            .map(|param_node| {
+                let text = source[param_node.byte_range()].trim();
+                let inner = text
+                    .strip_prefix('(')
+                    .and_then(|s| s.strip_suffix(')'))
+                    .unwrap_or(text)
+                    .trim();
+                collapse_whitespace(inner)
+            });
+        result
+    });
+
+    (return_type, params)
 }
 
 // ---------------------------------------------------------------------------
@@ -480,11 +783,12 @@ pub fn parse_symbols(
                 let mut symbol_db_ids: Vec<i64> = Vec::with_capacity(symbols.len());
                 for sym in &symbols {
                     conn.execute(
-                        "INSERT INTO symbols (blob_id, parent_id, name, kind, line, col, end_line, end_col)
-                         VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        "INSERT INTO symbols (blob_id, parent_id, name, kind, line, col, end_line, end_col, signature, return_type, params)
+                         VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                         rusqlite::params![
                             blob_id, sym.name, sym.kind,
-                            sym.line, sym.col, sym.end_line, sym.end_col
+                            sym.line, sym.col, sym.end_line, sym.end_col,
+                            sym.signature, sym.return_type, sym.params
                         ],
                     )?;
                     symbol_db_ids.push(conn.last_insert_rowid());
@@ -734,6 +1038,111 @@ int main() {
     fn test_unsupported_language() {
         assert!(get_config("fortran").is_none());
         assert!(get_config("haskell").is_none());
+    }
+
+    #[test]
+    fn test_rust_type_info() {
+        let source = r#"
+fn hello(x: i32, y: &str) -> String {
+    x.to_string()
+}
+
+struct Foo {
+    bar: Vec<String>,
+}
+
+impl Foo {
+    fn method(&self, n: usize) -> Option<i32> {
+        None
+    }
+}
+"#;
+        let config = rust_config();
+        let (symbols, _) = extract_symbols(source, &config).unwrap();
+
+        let hello = symbols.iter().find(|s| s.name == "hello").unwrap();
+        assert_eq!(hello.signature.as_deref(), Some("fn hello(x: i32, y: &str) -> String"));
+        assert_eq!(hello.return_type.as_deref(), Some("String"));
+        assert_eq!(hello.params.as_deref(), Some("x: i32, y: &str"));
+
+        let foo = symbols.iter().find(|s| s.name == "Foo" && s.kind == "struct").unwrap();
+        assert_eq!(foo.signature.as_deref(), Some("struct Foo"));
+        assert!(foo.return_type.is_none());
+        assert!(foo.params.is_none());
+
+        let method = symbols.iter().find(|s| s.name == "method").unwrap();
+        assert_eq!(method.return_type.as_deref(), Some("Option<i32>"));
+        assert_eq!(method.params.as_deref(), Some("&self, n: usize"));
+    }
+
+    #[test]
+    fn test_python_type_info() {
+        let source = "def hello(x: int, y: str) -> str:\n    return \"\"\n";
+        let config = python_config();
+        let (symbols, _) = extract_symbols(source, &config).unwrap();
+
+        let hello = &symbols[0];
+        assert_eq!(hello.return_type.as_deref(), Some("str"));
+        assert_eq!(hello.params.as_deref(), Some("x: int, y: str"));
+    }
+
+    #[test]
+    fn test_go_type_info() {
+        let source = r#"
+package main
+
+func hello(x int, y string) string {
+    return ""
+}
+"#;
+        let config = go_config();
+        let (symbols, _) = extract_symbols(source, &config).unwrap();
+
+        let hello = &symbols[0];
+        assert_eq!(hello.return_type.as_deref(), Some("string"));
+        assert_eq!(hello.params.as_deref(), Some("x int, y string"));
+    }
+
+    #[test]
+    fn test_typescript_type_info() {
+        let source = "function hello(x: number, y: string): string {\n    return \"\";\n}\n";
+        let config = typescript_config();
+        let (symbols, _) = extract_symbols(source, &config).expect("TS extraction failed");
+
+        assert!(!symbols.is_empty(), "should extract at least one symbol, got: {symbols:#?}");
+        let hello = &symbols[0];
+        assert_eq!(hello.return_type.as_deref(), Some("string"));
+        assert_eq!(hello.params.as_deref(), Some("x: number, y: string"));
+    }
+
+    #[test]
+    fn test_c_type_info() {
+        let source = r#"
+int add(int a, int b) {
+    return a + b;
+}
+"#;
+        let config = c_config();
+        let (symbols, _) = extract_symbols(source, &config).unwrap();
+
+        let add = symbols.iter().find(|s| s.name == "add").unwrap();
+        assert_eq!(add.return_type.as_deref(), Some("int"));
+        assert_eq!(add.params.as_deref(), Some("int a, int b"));
+    }
+
+    #[test]
+    fn test_js_no_types() {
+        let source = r#"
+function hello(x, y) {
+    return x;
+}
+"#;
+        let config = javascript_config();
+        let (symbols, _) = extract_symbols(source, &config).unwrap();
+
+        let hello = &symbols[0];
+        assert!(hello.return_type.is_none());
+        assert_eq!(hello.params.as_deref(), Some("x, y"));
     }
 
     #[test]

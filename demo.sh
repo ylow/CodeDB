@@ -12,7 +12,7 @@ set -euo pipefail
 # This script will:
 #   1. Index https://github.com/ylow/SFrameRust/ into /tmp/codedb-demo
 #   2. Show database stats
-#   3. Run a series of example queries demonstrating CodeDB's capabilities
+#   3. Run a series of queries demonstrating Sourcegraph-style search syntax
 
 CODEDB="cargo run -p codedb-cli --release --"
 ROOT="/tmp/codedb-demo"
@@ -29,15 +29,22 @@ header() {
     echo ""
 }
 
+run_search() {
+    echo -e "${DIM}\$ codedb search \"$1\"${RESET}"
+    $CODEDB --root "$ROOT" search "$1"
+    echo ""
+}
+
+run_search_sql() {
+    echo -e "${DIM}\$ codedb search --sql \"$1\"${RESET}"
+    $CODEDB --root "$ROOT" search --sql "$1"
+    echo ""
+}
+
 run_sql() {
     echo -e "${DIM}\$ codedb sql \"$1\"${RESET}"
     $CODEDB --root "$ROOT" sql "$1"
     echo ""
-}
-
-run_search() {
-    echo -e "${DIM}\$ codedb search \"$1\"${RESET}"
-    $CODEDB --root "$ROOT" search "$1"
 }
 
 # ──────────────────────────────────────────────
@@ -60,8 +67,8 @@ header "Database Stats"
 run_sql "SELECT
   (SELECT COUNT(*) FROM commits) as commits,
   (SELECT COUNT(*) FROM blobs) as unique_blobs,
-  (SELECT COUNT(*) FROM diffs) as diffs,
-  (SELECT COUNT(*) FROM refs) as refs,
+  (SELECT COUNT(*) FROM symbols) as symbols,
+  (SELECT COUNT(*) FROM symbol_refs) as call_refs,
   (SELECT COUNT(*) FROM file_revs) as files_at_tips"
 
 # ──────────────────────────────────────────────
@@ -76,71 +83,142 @@ WHERE r.name = 'refs/heads/main' AND b.language IS NOT NULL
 GROUP BY b.language
 ORDER BY count DESC"
 
-# ──────────────────────────────────────────────
-# Step 5: Recent commits
-# ──────────────────────────────────────────────
-header "Recent Commits"
-run_sql "SELECT substr(hash, 1, 10) as hash, author, substr(message, 1, 65) as message
-FROM commits ORDER BY timestamp DESC LIMIT 10"
+# ══════════════════════════════════════════════
+# Sourcegraph-style queries start here
+# ══════════════════════════════════════════════
 
 # ──────────────────────────────────────────────
-# Step 6: Full-text code search
+# Step 5: Basic code search with snippets
 # ──────────────────────────────────────────────
-header "Code Search: 'rayon parallel'"
-run_sql "SELECT fr.path, round(cs.score, 2) as score
-FROM code_search('rayon parallel') cs
-JOIN blobs b ON b.id = cs.blob_id
+header "Code Search: FlexType"
+run_search "FlexType count:5"
+
+# ──────────────────────────────────────────────
+# Step 6: Filtered code search
+# ──────────────────────────────────────────────
+header "Code Search: 'serialize' in Rust source files (no tests)"
+run_search "lang:rust file:*.rs -file:test serialize"
+
+# ──────────────────────────────────────────────
+# Step 7: Show generated SQL (--sql flag)
+# ──────────────────────────────────────────────
+header "Show Generated SQL"
+run_search_sql "lang:rust type:symbol SFrame"
+
+# ──────────────────────────────────────────────
+# Step 8: Symbol search — find all structs named SFrame
+# ──────────────────────────────────────────────
+header "Symbol Search: structs matching 'SFrame'"
+run_search "type:symbol select:symbol.struct lang:rust SFrame"
+
+# ──────────────────────────────────────────────
+# Step 9: Symbol search — all functions in the csv_parser module
+# ──────────────────────────────────────────────
+header "Symbol Search: functions in csv_parser"
+run_search "type:symbol select:symbol.function file:csv_parser"
+
+# ──────────────────────────────────────────────
+# Step 10: Who calls groupby()?
+# ──────────────────────────────────────────────
+header "Cross-reference: who calls groupby()?"
+run_search "calls:groupby count:15"
+
+# ──────────────────────────────────────────────
+# Step 11: What does groupby() call?
+# ──────────────────────────────────────────────
+header "Cross-reference: what does groupby() call?"
+run_search "calledby:groupby"
+
+# ──────────────────────────────────────────────
+# Step 12: Which functions use parallel iteration?
+# ──────────────────────────────────────────────
+header "Cross-reference: functions that call par_iter() (rayon parallel)"
+run_search "calls:par_iter"
+
+# ──────────────────────────────────────────────
+# Step 13: Functions returning SFrame (type info)
+# ──────────────────────────────────────────────
+header "Type Info: functions returning SFrame"
+run_sql "SELECT DISTINCT fr.path || ':' || s.line AS location, s.signature
+FROM symbols s
+JOIN blobs b ON b.id = s.blob_id
+JOIN file_revs fr ON fr.blob_id = b.id
+JOIN refs r ON r.commit_id = fr.commit_id
+WHERE s.return_type LIKE '%SFrame%'
+  AND s.kind = 'function'
+  AND r.name = 'refs/heads/main'
+ORDER BY fr.path, s.line
+LIMIT 10"
+
+# ──────────────────────────────────────────────
+# Step 14: Functions taking SFrame parameters
+# ──────────────────────────────────────────────
+header "Type Info: functions with SFrame parameters"
+run_sql "SELECT DISTINCT fr.path || ':' || s.line AS location, s.params
+FROM symbols s
+JOIN blobs b ON b.id = s.blob_id
+JOIN file_revs fr ON fr.blob_id = b.id
+JOIN refs r ON r.commit_id = fr.commit_id
+WHERE s.params LIKE '%SFrame%'
+  AND s.kind = 'function'
+  AND r.name = 'refs/heads/main'
+ORDER BY fr.path, s.line
+LIMIT 10"
+
+# ──────────────────────────────────────────────
+# Step 15: Most called functions (excluding builtins)
+# ──────────────────────────────────────────────
+header "Most called functions (domain-specific)"
+run_sql "SELECT sr.ref_name AS function, COUNT(*) AS calls
+FROM symbol_refs sr
+JOIN blobs b ON b.id = sr.blob_id
 JOIN file_revs fr ON fr.blob_id = b.id
 JOIN refs r ON r.commit_id = fr.commit_id
 WHERE r.name = 'refs/heads/main'
-GROUP BY fr.path
-ORDER BY cs.score DESC
-LIMIT 10"
+  AND sr.kind = 'call'
+  AND sr.ref_name NOT IN (
+    'new','unwrap','assert_eq','Ok','len','vec','clone','iter',
+    'push','collect','map','format','assert','to_string','expect',
+    'get','into','from','Some','None','Err','println','is_empty',
+    'write_u64','write_u8','read_u64','read_u8','enumerate','insert'
+  )
+GROUP BY sr.ref_name
+ORDER BY calls DESC
+LIMIT 15"
 
 # ──────────────────────────────────────────────
-# Step 7: Search with snippets
+# Step 16: Diff search — commits that touched streaming
 # ──────────────────────────────────────────────
-header "Search with Snippets: 'FlexType'"
-run_search "FlexType"
+header "Diff Search: commits that touched 'streaming' in Rust files"
+run_search "type:diff file:*.rs streaming count:5"
 
 # ──────────────────────────────────────────────
-# Step 8: Diff search — find commits that touched 'streaming'
+# Step 17: Commit search — recent refactors
 # ──────────────────────────────────────────────
-header "Diff Search: commits that touched 'streaming'"
-run_sql "SELECT substr(c.hash, 1, 10) as hash, substr(c.message, 1, 65) as message, round(ds.score, 2) as score
-FROM diff_search('streaming') ds
-JOIN diffs d ON d.id = ds.diff_id
-JOIN commits c ON c.id = d.commit_id
-GROUP BY c.hash
-ORDER BY ds.score DESC
-LIMIT 10"
+header "Commit Search: refactoring commits"
+run_search "type:commit refactor count:5"
 
 # ──────────────────────────────────────────────
-# Step 9: Filter by file extension
+# Step 18: Commit search — by author
 # ──────────────────────────────────────────────
-header "Code Search: 'serialize' in .rs files only"
-run_sql "SELECT fr.path, round(cs.score, 2) as score
-FROM code_search('serialize') cs
-JOIN blobs b ON b.id = cs.blob_id
-JOIN file_revs fr ON fr.blob_id = b.id
-JOIN refs r ON r.commit_id = fr.commit_id
-WHERE r.name = 'refs/heads/main' AND fr.path GLOB '*.rs'
-GROUP BY fr.path
-ORDER BY cs.score DESC
-LIMIT 10"
+header "Commit Search: commits by author with 'parallel' in message"
+run_search "type:commit author:Yucheng parallel count:5"
 
 # ──────────────────────────────────────────────
-# Step 10: Incremental re-index
+# Step 19: Incremental re-index
 # ──────────────────────────────────────────────
 header "Incremental Re-index (should be fast — no new commits)"
 time $CODEDB --root "$ROOT" index "$REPO"
-
-run_sql "SELECT COUNT(*) as total_commits FROM commits"
+echo ""
 
 header "Demo complete!"
 echo "Data directory: $ROOT"
 echo "SQLite database: $ROOT/db.sqlite"
 echo ""
 echo "Try your own queries:"
-echo "  cargo run -p codedb-cli --release -- --root $ROOT search \"your query\""
-echo "  cargo run -p codedb-cli --release -- --root $ROOT sql \"SELECT ...\""
+echo "  $CODEDB --root $ROOT search \"FlexType\""
+echo "  $CODEDB --root $ROOT search \"type:symbol lang:rust SFrame\""
+echo "  $CODEDB --root $ROOT search \"type:diff streaming\""
+echo "  $CODEDB --root $ROOT search \"type:commit author:Yucheng parallel\""
+echo "  $CODEDB --root $ROOT search --sql \"lang:rust file:*.rs serialize\""
+echo "  $CODEDB --root $ROOT sql \"SELECT ...\""

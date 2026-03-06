@@ -263,4 +263,18 @@ fn test_sourcegraph_queries() {
         !results.rows.is_empty(),
         "Code search with -file:test should return results"
     );
+
+    // calls: filter — find functions that call a given function
+    let results = db.search("calls:groupby").unwrap();
+    assert!(
+        !results.rows.is_empty(),
+        "calls:groupby should find callers of groupby"
+    );
+
+    // calledby: filter — find what a function calls
+    let results = db.search("calledby:groupby").unwrap();
+    assert!(
+        !results.rows.is_empty(),
+        "calledby:groupby should find callees of groupby"
+    );
 }

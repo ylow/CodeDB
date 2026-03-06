@@ -33,6 +33,8 @@ pub struct Filters {
     pub after: Option<String>,
     pub message: Option<String>,
     pub select: Option<SelectType>,
+    pub calls: Option<String>,
+    pub calledby: Option<String>,
 }
 
 /// Result of parsing a Sourcegraph-style query string.
@@ -188,6 +190,12 @@ pub fn parse_query(input: &str) -> Result<ParsedQuery> {
                 (false, "select") => {
                     filters.select = Some(parse_select(value)?);
                 }
+                (false, "calls") => {
+                    filters.calls = Some(value.to_string());
+                }
+                (false, "calledby") => {
+                    filters.calledby = Some(value.to_string());
+                }
                 (true, other) => bail!("Negation not supported for '{other}:'"),
                 (false, _) => {
                     // Not a known filter — treat as search term
@@ -241,6 +249,13 @@ fn pattern_match_clause(column: &str, pattern: &str, p: &mut ParamCollector) -> 
 
 /// Translate a parsed query into SQL.
 pub fn translate(query: &ParsedQuery) -> Result<TranslatedQuery> {
+    // calls: and calledby: imply symbol search regardless of type:
+    if query.filters.calls.is_some() {
+        return translate_callers(query);
+    }
+    if query.filters.calledby.is_some() {
+        return translate_callees(query);
+    }
     match query.search_type {
         SearchType::Code => translate_code(query),
         SearchType::Diff => translate_diff(query),
@@ -600,6 +615,155 @@ fn translate_symbol(query: &ParsedQuery) -> Result<TranslatedQuery> {
     })
 }
 
+/// Translate `calls:X` — find functions that call X.
+fn translate_callers(query: &ParsedQuery) -> Result<TranslatedQuery> {
+    let call_target = query.filters.calls.as_ref().unwrap();
+    let mut p = ParamCollector::new();
+    let mut joins = vec![
+        "JOIN symbols s ON s.id = sr.symbol_id".to_string(),
+        "JOIN blobs b ON b.id = sr.blob_id".to_string(),
+        "JOIN file_revs fr ON fr.blob_id = b.id".to_string(),
+        "JOIN refs r ON r.commit_id = fr.commit_id".to_string(),
+    ];
+    let mut conditions = Vec::new();
+
+    // Match the called function name
+    let clause = pattern_match_clause("sr.ref_name", call_target, &mut p);
+    conditions.push(format!("AND {clause}"));
+    conditions.push("AND sr.kind = 'call'".to_string());
+    conditions.push("AND s.kind = 'function'".to_string());
+
+    if let Some(ref repo) = query.filters.repo {
+        joins.push("JOIN repos rp ON rp.id = r.repo_id".to_string());
+        let clause = pattern_match_clause("rp.name", repo, &mut p);
+        conditions.push(format!("AND {clause}"));
+    }
+
+    if let Some(ref file) = query.filters.file {
+        let clause = pattern_match_clause("fr.path", file, &mut p);
+        conditions.push(format!("AND {clause}"));
+    }
+
+    if let Some(ref neg_file) = query.filters.neg_file {
+        let clause = pattern_match_clause("fr.path", neg_file, &mut p);
+        conditions.push(format!("AND NOT ({clause})"));
+    }
+
+    if let Some(ref lang) = query.filters.lang {
+        let placeholder = p.add(lang.clone());
+        conditions.push(format!("AND b.language = {placeholder}"));
+    }
+
+    // rev: filter
+    let rev = query.filters.rev.clone().unwrap_or_else(|| "main".to_string());
+    let rev_ref = if rev.starts_with("refs/") {
+        rev
+    } else {
+        format!("refs/heads/{rev}")
+    };
+    let rev_placeholder = p.add(rev_ref);
+    conditions.push(format!("AND r.name = {rev_placeholder}"));
+
+    let limit = query.filters.count.unwrap_or(20);
+
+    let conditions_str = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!("\n  {}", conditions.join("\n  "))
+    };
+
+    let joins_str = joins.join("\n");
+
+    let sql = format!(
+        "SELECT DISTINCT fr.path, s.name, s.kind, s.line\n\
+         FROM symbol_refs sr\n\
+         {joins_str}\n\
+         WHERE 1=1{conditions_str}\n\
+         ORDER BY fr.path, s.line\n\
+         LIMIT {limit}"
+    );
+
+    Ok(TranslatedQuery {
+        sql,
+        params: p.params,
+        search_type: SearchType::Symbol,
+    })
+}
+
+/// Translate `calledby:X` — find what function X calls.
+fn translate_callees(query: &ParsedQuery) -> Result<TranslatedQuery> {
+    let caller_name = query.filters.calledby.as_ref().unwrap();
+    let mut p = ParamCollector::new();
+    let mut joins = vec![
+        "JOIN symbol_refs sr ON sr.symbol_id = s.id AND sr.blob_id = s.blob_id".to_string(),
+        "JOIN blobs b ON b.id = sr.blob_id".to_string(),
+        "JOIN file_revs fr ON fr.blob_id = b.id".to_string(),
+        "JOIN refs r ON r.commit_id = fr.commit_id".to_string(),
+    ];
+    let mut conditions = Vec::new();
+
+    // Match the caller function name
+    let clause = pattern_match_clause("s.name", caller_name, &mut p);
+    conditions.push(format!("AND {clause}"));
+    conditions.push("AND s.kind = 'function'".to_string());
+
+    if let Some(ref repo) = query.filters.repo {
+        joins.push("JOIN repos rp ON rp.id = r.repo_id".to_string());
+        let clause = pattern_match_clause("rp.name", repo, &mut p);
+        conditions.push(format!("AND {clause}"));
+    }
+
+    if let Some(ref file) = query.filters.file {
+        let clause = pattern_match_clause("fr.path", file, &mut p);
+        conditions.push(format!("AND {clause}"));
+    }
+
+    if let Some(ref neg_file) = query.filters.neg_file {
+        let clause = pattern_match_clause("fr.path", neg_file, &mut p);
+        conditions.push(format!("AND NOT ({clause})"));
+    }
+
+    if let Some(ref lang) = query.filters.lang {
+        let placeholder = p.add(lang.clone());
+        conditions.push(format!("AND b.language = {placeholder}"));
+    }
+
+    // rev: filter
+    let rev = query.filters.rev.clone().unwrap_or_else(|| "main".to_string());
+    let rev_ref = if rev.starts_with("refs/") {
+        rev
+    } else {
+        format!("refs/heads/{rev}")
+    };
+    let rev_placeholder = p.add(rev_ref);
+    conditions.push(format!("AND r.name = {rev_placeholder}"));
+
+    let limit = query.filters.count.unwrap_or(20);
+
+    let conditions_str = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!("\n  {}", conditions.join("\n  "))
+    };
+
+    let joins_str = joins.join("\n");
+
+    let sql = format!(
+        "SELECT DISTINCT fr.path, sr.ref_name AS name, sr.kind, sr.line\n\
+         FROM symbols s\n\
+         {joins_str}\n\
+         WHERE 1=1{conditions_str}\n\
+         ORDER BY sr.line\n\
+         LIMIT {limit}"
+    );
+
+    Ok(TranslatedQuery {
+        sql,
+        params: p.params,
+        search_type: SearchType::Symbol,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -920,5 +1084,76 @@ mod tests {
         let q = parse_query("type:symbol").unwrap();
         let err = translate(&q).unwrap_err();
         assert!(err.to_string().contains("requires a search pattern"), "got: {err}");
+    }
+
+    // --- calls: / calledby: tests ---
+
+    #[test]
+    fn test_parse_calls_filter() {
+        let q = parse_query("calls:groupby").unwrap();
+        assert_eq!(q.filters.calls.as_deref(), Some("groupby"));
+        assert!(q.search_pattern.is_empty());
+    }
+
+    #[test]
+    fn test_parse_calledby_filter() {
+        let q = parse_query("calledby:groupby").unwrap();
+        assert_eq!(q.filters.calledby.as_deref(), Some("groupby"));
+    }
+
+    #[test]
+    fn test_translate_calls_basic() {
+        let q = parse_query("calls:groupby").unwrap();
+        let t = translate(&q).unwrap();
+        assert_eq!(t.search_type, SearchType::Symbol);
+        assert!(t.sql.contains("symbol_refs sr"));
+        assert!(t.sql.contains("sr.ref_name LIKE"));
+        assert!(t.sql.contains("sr.kind = 'call'"));
+        assert!(t.sql.contains("s.kind = 'function'"));
+        assert!(t.params.iter().any(|p| p == "%groupby%"));
+    }
+
+    #[test]
+    fn test_translate_calls_with_lang() {
+        let q = parse_query("calls:par_iter lang:rust").unwrap();
+        let t = translate(&q).unwrap();
+        assert!(t.sql.contains("b.language ="));
+        assert!(t.params.iter().any(|p| p == "rust"));
+    }
+
+    #[test]
+    fn test_translate_calls_with_file() {
+        let q = parse_query("calls:groupby file:*.rs").unwrap();
+        let t = translate(&q).unwrap();
+        assert!(t.sql.contains("fr.path GLOB"));
+        assert!(t.params.iter().any(|p| p == "*.rs"));
+    }
+
+    #[test]
+    fn test_translate_calledby_basic() {
+        let q = parse_query("calledby:groupby").unwrap();
+        let t = translate(&q).unwrap();
+        assert_eq!(t.search_type, SearchType::Symbol);
+        assert!(t.sql.contains("FROM symbols s"));
+        assert!(t.sql.contains("symbol_refs sr ON sr.symbol_id = s.id"));
+        assert!(t.sql.contains("s.name LIKE"));
+        assert!(t.sql.contains("s.kind = 'function'"));
+        assert!(t.params.iter().any(|p| p == "%groupby%"));
+    }
+
+    #[test]
+    fn test_translate_calledby_with_count() {
+        let q = parse_query("calledby:groupby count:10").unwrap();
+        let t = translate(&q).unwrap();
+        assert!(t.sql.contains("LIMIT 10"));
+    }
+
+    #[test]
+    fn test_translate_calls_overrides_type() {
+        // calls: should work even if type:commit is specified
+        let q = parse_query("type:commit calls:foo").unwrap();
+        let t = translate(&q).unwrap();
+        assert_eq!(t.search_type, SearchType::Symbol);
+        assert!(t.sql.contains("symbol_refs sr"));
     }
 }
