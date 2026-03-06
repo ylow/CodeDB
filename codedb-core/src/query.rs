@@ -226,11 +226,15 @@ pub fn parse_query(input: &str) -> Result<ParsedQuery> {
 /// Helper: tracks SQL parameters and returns `?N` placeholders.
 struct ParamCollector {
     params: Vec<String>,
+    case_sensitive: bool,
 }
 
 impl ParamCollector {
-    fn new() -> Self {
-        Self { params: Vec::new() }
+    fn new(case_sensitive: bool) -> Self {
+        Self {
+            params: Vec::new(),
+            case_sensitive,
+        }
     }
 
     /// Add a parameter and return its `?N` placeholder string.
@@ -240,10 +244,21 @@ impl ParamCollector {
     }
 }
 
-/// If pattern contains `*` or `?`, use GLOB. Otherwise use LIKE substring match.
+/// Match a column against a pattern, respecting case sensitivity.
+///
+/// - With wildcards (`*`/`?`): uses GLOB (case-sensitive) or `lower()` GLOB (case-insensitive).
+/// - Without wildcards: uses GLOB `*pat*` (case-sensitive) or LIKE `%pat%` (case-insensitive).
 fn pattern_match_clause(column: &str, pattern: &str, p: &mut ParamCollector) -> String {
     if pattern.contains('*') || pattern.contains('?') {
-        let placeholder = p.add(pattern.to_string());
+        if p.case_sensitive {
+            let placeholder = p.add(pattern.to_string());
+            format!("{column} GLOB {placeholder}")
+        } else {
+            let placeholder = p.add(pattern.to_lowercase());
+            format!("lower({column}) GLOB {placeholder}")
+        }
+    } else if p.case_sensitive {
+        let placeholder = p.add(format!("*{pattern}*"));
         format!("{column} GLOB {placeholder}")
     } else {
         let placeholder = p.add(format!("%{pattern}%"));
@@ -276,7 +291,7 @@ fn translate_code(query: &ParsedQuery) -> Result<TranslatedQuery> {
         bail!("Code search requires a search pattern");
     }
 
-    let mut p = ParamCollector::new();
+    let mut p = ParamCollector::new(query.filters.case_sensitive);
     let search_param = p.add(query.search_pattern.clone());
 
     let mut joins = vec![
@@ -379,7 +394,7 @@ fn translate_diff(query: &ParsedQuery) -> Result<TranslatedQuery> {
         bail!("Diff search requires a search pattern");
     }
 
-    let mut p = ParamCollector::new();
+    let mut p = ParamCollector::new(query.filters.case_sensitive);
     let search_param = p.add(query.search_pattern.clone());
 
     let mut joins = vec![
@@ -462,7 +477,7 @@ fn translate_diff(query: &ParsedQuery) -> Result<TranslatedQuery> {
 }
 
 fn translate_commit(query: &ParsedQuery) -> Result<TranslatedQuery> {
-    let mut p = ParamCollector::new();
+    let mut p = ParamCollector::new(query.filters.case_sensitive);
     let mut conditions = Vec::new();
 
     if !query.search_pattern.is_empty() {
@@ -536,7 +551,7 @@ fn translate_commit(query: &ParsedQuery) -> Result<TranslatedQuery> {
 }
 
 fn translate_symbol(query: &ParsedQuery) -> Result<TranslatedQuery> {
-    let mut p = ParamCollector::new();
+    let mut p = ParamCollector::new(query.filters.case_sensitive);
     let mut joins = vec![
         "JOIN blobs b ON b.id = s.blob_id".to_string(),
         "JOIN file_revs fr ON fr.blob_id = b.id".to_string(),
@@ -633,7 +648,7 @@ fn translate_symbol(query: &ParsedQuery) -> Result<TranslatedQuery> {
 /// Translate `calls:X` — find functions that call X.
 fn translate_callers(query: &ParsedQuery) -> Result<TranslatedQuery> {
     let call_target = query.filters.calls.as_ref().unwrap();
-    let mut p = ParamCollector::new();
+    let mut p = ParamCollector::new(query.filters.case_sensitive);
     let mut joins = vec![
         "JOIN symbols s ON s.id = sr.symbol_id".to_string(),
         "JOIN blobs b ON b.id = sr.blob_id".to_string(),
@@ -708,7 +723,7 @@ fn translate_callers(query: &ParsedQuery) -> Result<TranslatedQuery> {
 /// Translate `calledby:X` — find what function X calls.
 fn translate_callees(query: &ParsedQuery) -> Result<TranslatedQuery> {
     let caller_name = query.filters.calledby.as_ref().unwrap();
-    let mut p = ParamCollector::new();
+    let mut p = ParamCollector::new(query.filters.case_sensitive);
     let mut joins = vec![
         "JOIN symbol_refs sr ON sr.symbol_id = s.id AND sr.blob_id = s.blob_id".to_string(),
         "JOIN blobs b ON b.id = sr.blob_id".to_string(),
@@ -949,7 +964,8 @@ mod tests {
         let q = parse_query("lang:rust file:*.rs count:10 foo").unwrap();
         let t = translate(&q).unwrap();
         assert!(t.sql.contains("b.language ="));
-        assert!(t.sql.contains("fr.path GLOB"));
+        // Default case:no → case-insensitive GLOB via lower()
+        assert!(t.sql.contains("lower(fr.path) GLOB"), "sql: {}", t.sql);
         assert!(t.sql.contains("LIMIT 10"));
         assert_eq!(t.params[0], "foo");
     }
@@ -1004,7 +1020,8 @@ mod tests {
     fn test_translate_code_glob_match() {
         let q = parse_query("file:*.rs foo").unwrap();
         let t = translate(&q).unwrap();
-        assert!(t.sql.contains("GLOB"));
+        // Default case:no → case-insensitive GLOB via lower()
+        assert!(t.sql.contains("lower(fr.path) GLOB"), "sql: {}", t.sql);
         assert!(t.params.iter().any(|p| p == "*.rs"));
     }
 
@@ -1140,7 +1157,8 @@ mod tests {
     fn test_translate_calls_with_file() {
         let q = parse_query("calls:groupby file:*.rs").unwrap();
         let t = translate(&q).unwrap();
-        assert!(t.sql.contains("fr.path GLOB"));
+        // Default case:no → case-insensitive GLOB via lower()
+        assert!(t.sql.contains("lower(fr.path) GLOB"), "sql: {}", t.sql);
         assert!(t.params.iter().any(|p| p == "*.rs"));
     }
 
@@ -1204,5 +1222,86 @@ mod tests {
         let t = translate(&q).unwrap();
         assert_eq!(t.search_type, SearchType::Symbol);
         assert!(t.sql.contains("s.return_type"));
+    }
+
+    // --- case: filter tests ---
+
+    #[test]
+    fn test_parse_case_yes() {
+        let q = parse_query("case:yes foo").unwrap();
+        assert!(q.filters.case_sensitive);
+    }
+
+    #[test]
+    fn test_parse_case_no() {
+        let q = parse_query("case:no foo").unwrap();
+        assert!(!q.filters.case_sensitive);
+    }
+
+    #[test]
+    fn test_parse_case_default_insensitive() {
+        let q = parse_query("foo").unwrap();
+        assert!(!q.filters.case_sensitive);
+    }
+
+    #[test]
+    fn test_translate_code_case_insensitive_default() {
+        // Default (case:no) uses LIKE for substring matching
+        let q = parse_query("foo").unwrap();
+        let t = translate(&q).unwrap();
+        assert!(t.sql.contains("code_search"));
+        // File/repo filters use LIKE by default
+    }
+
+    #[test]
+    fn test_translate_symbol_case_sensitive() {
+        let q = parse_query("type:symbol case:yes SFrame").unwrap();
+        let t = translate(&q).unwrap();
+        // case:yes → GLOB for substring match
+        assert!(t.sql.contains("s.name GLOB"), "sql: {}", t.sql);
+        assert!(t.params.iter().any(|p| p == "*SFrame*"), "params: {:?}", t.params);
+    }
+
+    #[test]
+    fn test_translate_symbol_case_insensitive() {
+        let q = parse_query("type:symbol case:no SFrame").unwrap();
+        let t = translate(&q).unwrap();
+        // case:no → LIKE for substring match
+        assert!(t.sql.contains("s.name LIKE"), "sql: {}", t.sql);
+        assert!(t.params.iter().any(|p| p == "%SFrame%"), "params: {:?}", t.params);
+    }
+
+    #[test]
+    fn test_translate_commit_case_sensitive() {
+        let q = parse_query("type:commit case:yes Refactor").unwrap();
+        let t = translate(&q).unwrap();
+        assert!(t.sql.contains("c.message GLOB"), "sql: {}", t.sql);
+        assert!(t.params.iter().any(|p| p == "*Refactor*"), "params: {:?}", t.params);
+    }
+
+    #[test]
+    fn test_translate_calls_case_sensitive() {
+        let q = parse_query("case:yes calls:GroupBy").unwrap();
+        let t = translate(&q).unwrap();
+        assert!(t.sql.contains("sr.ref_name GLOB"), "sql: {}", t.sql);
+        assert!(t.params.iter().any(|p| p == "*GroupBy*"), "params: {:?}", t.params);
+    }
+
+    #[test]
+    fn test_translate_case_sensitive_with_glob_pattern() {
+        // Wildcards + case:yes → GLOB as-is
+        let q = parse_query("type:symbol case:yes file:*.RS lang:rust foo").unwrap();
+        let t = translate(&q).unwrap();
+        assert!(t.sql.contains("fr.path GLOB"), "sql: {}", t.sql);
+        assert!(t.params.iter().any(|p| p == "*.RS"), "params: {:?}", t.params);
+    }
+
+    #[test]
+    fn test_translate_case_insensitive_with_glob_pattern() {
+        // Wildcards + case:no → lower() GLOB with lowercased pattern
+        let q = parse_query("type:symbol case:no file:*.RS lang:rust foo").unwrap();
+        let t = translate(&q).unwrap();
+        assert!(t.sql.contains("lower(fr.path) GLOB"), "sql: {}", t.sql);
+        assert!(t.params.iter().any(|p| p == "*.rs"), "params: {:?}", t.params);
     }
 }
