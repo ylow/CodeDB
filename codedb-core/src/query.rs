@@ -35,6 +35,7 @@ pub struct Filters {
     pub select: Option<SelectType>,
     pub calls: Option<String>,
     pub calledby: Option<String>,
+    pub returns: Option<String>,
 }
 
 /// Result of parsing a Sourcegraph-style query string.
@@ -196,6 +197,9 @@ pub fn parse_query(input: &str) -> Result<ParsedQuery> {
                 (false, "calledby") => {
                     filters.calledby = Some(value.to_string());
                 }
+                (false, "returns") => {
+                    filters.returns = Some(value.to_string());
+                }
                 (true, other) => bail!("Negation not supported for '{other}:'"),
                 (false, _) => {
                     // Not a known filter — treat as search term
@@ -249,12 +253,15 @@ fn pattern_match_clause(column: &str, pattern: &str, p: &mut ParamCollector) -> 
 
 /// Translate a parsed query into SQL.
 pub fn translate(query: &ParsedQuery) -> Result<TranslatedQuery> {
-    // calls: and calledby: imply symbol search regardless of type:
+    // calls:, calledby:, and returns: imply symbol search regardless of type:
     if query.filters.calls.is_some() {
         return translate_callers(query);
     }
     if query.filters.calledby.is_some() {
         return translate_callees(query);
+    }
+    if query.filters.returns.is_some() {
+        return translate_symbol(query);
     }
     match query.search_type {
         SearchType::Code => translate_code(query),
@@ -568,6 +575,13 @@ fn translate_symbol(query: &ParsedQuery) -> Result<TranslatedQuery> {
         conditions.push(format!("AND s.kind = {placeholder}"));
     }
 
+    // returns: filter — match return type, implies function-like symbols
+    if let Some(ref ret) = query.filters.returns {
+        let clause = pattern_match_clause("s.return_type", ret, &mut p);
+        conditions.push(format!("AND {clause}"));
+        conditions.push("AND s.kind IN ('function', 'method')".to_string());
+    }
+
     // rev: filter
     let rev = query.filters.rev.clone().unwrap_or_else(|| "main".to_string());
     let rev_ref = if rev.starts_with("refs/") {
@@ -582,10 +596,11 @@ fn translate_symbol(query: &ParsedQuery) -> Result<TranslatedQuery> {
         && !matches!(query.filters.select, Some(SelectType::SymbolKind(_)))
         && query.filters.lang.is_none()
         && query.filters.file.is_none()
+        && query.filters.returns.is_none()
     {
         bail!(
             "Symbol search requires a search pattern or filter \
-             (lang:, file:, select:symbol.<kind>)"
+             (lang:, file:, select:symbol.<kind>, returns:)"
         );
     }
 
@@ -1155,5 +1170,39 @@ mod tests {
         let t = translate(&q).unwrap();
         assert_eq!(t.search_type, SearchType::Symbol);
         assert!(t.sql.contains("symbol_refs sr"));
+    }
+
+    // --- returns: tests ---
+
+    #[test]
+    fn test_parse_returns_filter() {
+        let q = parse_query("returns:BatchIterator").unwrap();
+        assert_eq!(q.filters.returns.as_deref(), Some("BatchIterator"));
+    }
+
+    #[test]
+    fn test_translate_returns_basic() {
+        let q = parse_query("returns:BatchIterator").unwrap();
+        let t = translate(&q).unwrap();
+        assert_eq!(t.search_type, SearchType::Symbol);
+        assert!(t.sql.contains("s.return_type LIKE"));
+        assert!(t.sql.contains("s.kind IN ('function', 'method')"));
+        assert!(t.params.iter().any(|p| p == "%BatchIterator%"));
+    }
+
+    #[test]
+    fn test_translate_returns_with_lang() {
+        let q = parse_query("returns:String lang:rust").unwrap();
+        let t = translate(&q).unwrap();
+        assert!(t.sql.contains("s.return_type LIKE"));
+        assert!(t.sql.contains("b.language ="));
+    }
+
+    #[test]
+    fn test_translate_returns_overrides_type() {
+        let q = parse_query("type:commit returns:i32").unwrap();
+        let t = translate(&q).unwrap();
+        assert_eq!(t.search_type, SearchType::Symbol);
+        assert!(t.sql.contains("s.return_type"));
     }
 }
