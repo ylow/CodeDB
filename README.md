@@ -33,6 +33,12 @@ codedb --root ~/.codedb search "function_name"
 # Filtered search
 codedb --root ~/.codedb search "lang:rust file:*.rs -file:test serialize"
 
+# Regex search
+codedb --root ~/.codedb search "/fn\s+process_\w+/"
+
+# OR search: match either term
+codedb --root ~/.codedb search "serialize OR deserialize"
+
 # Find symbols
 codedb --root ~/.codedb search "type:symbol select:symbol.function SFrame"
 
@@ -87,6 +93,14 @@ Bare words are search terms; filters use `key:value` syntax.
 | `calls:` | Find functions that call a given function | `calls:groupby` |
 | `calledby:` | Find functions called by a given function | `calledby:groupby` |
 | `returns:` | Find functions returning a given type | `returns:SFrame` |
+| `patterntype:` | Pattern interpretation: `literal`, `keyword`, `regexp` | `patterntype:regexp` |
+
+### Search Patterns
+
+- **Bare words** — `foo bar` matches files containing both terms (implicit AND).
+- **Quoted phrases** — `"error handling"` matches the exact phrase.
+- **OR operator** — `foo OR bar` matches files containing either term. Works in all search types.
+- **Regex** — `/pattern/` or `patterntype:regexp pattern` for regex matching (code and diff search only).
 
 ### Search Types
 
@@ -113,18 +127,20 @@ The core query experience is compatible:
   `before:`, `after:`, `message:` all work as expected.
 - **Negation** — `-file:`, `-repo:`, `-lang:`, `-author:`, `-message:` all supported.
 - **`@revision`** — `repo:foo@branch` works, equivalent to `repo:foo rev:branch`.
-- **`patterntype:literal`** and **`patterntype:keyword`** — accepted (default behavior).
+- **`patterntype:`** — `literal`, `keyword`, and `regexp` all supported.
+- **OR operator** — `foo OR bar` works across all search types.
+- **Regex** — `/pattern/` syntax for code and diff search.
 
 ### What's different
 
 | Area | Sourcegraph | CodeDB |
 |------|------------|--------|
 | **Scope** | Searches across thousands of repositories on a hosted instance. Has `fork:`, `archived:`, `visibility:`, `repogroup:`, `repo:has.file()`, `repo:has.path()`, `file:has.owner()` for filtering across a large corpus. | Designed for one or a few locally-indexed repos. Repository-level metadata filters (`fork:`, `archived:`, `visibility:`, `repogroup:`, `repo:has.*`, `file:has.*`) are not supported — they don't apply at this scale. |
-| **Regex** | Supports `/regex/` patterns and `patterntype:regexp`. | No regex in the query language. Patterns match as substrings (or GLOB wildcards with `*`/`?`). For regex needs, drop to raw SQL where Tantivy supports regex mode. |
-| **Boolean operators** | Full `AND`, `OR`, `NOT` with parenthesized grouping. | All terms are implicitly AND'ed. No `OR`, `NOT`, or parentheses. Negation supported for filters (`-file:`, `-repo:`, `-lang:`, `-author:`, `-message:`). |
+| **Regex** | Supports `/regex/` patterns and `patterntype:regexp`. | Supported for code and diff search via `/pattern/` or `patterntype:regexp`. Not available for symbol or commit search (use raw SQL). |
+| **Boolean operators** | Full `AND`, `OR`, `NOT` with parenthesized grouping. | `OR` supported between search terms (`foo OR bar`). All other terms are implicitly AND'ed. No `NOT` or parentheses. Negation supported for filters (`-file:`, `-repo:`, `-lang:`, `-author:`, `-message:`). |
 | **Structural search** | `type:structural` with [Comby](https://comby.dev/) patterns for syntax-aware matching (e.g., `fmt.Sprintf(:[args])`). | Not supported. CodeDB addresses similar use cases through symbol extraction and cross-reference queries instead. |
 | **Code intelligence** | Separate LSIF/SCIP-based precise code navigation (go-to-definition, find-references). Not part of the query language. | Built into the query language via `calls:`, `calledby:`, and `returns:` filters. Uses tree-sitter extraction — less precise than LSIF/SCIP but requires no separate indexing pipeline. |
-| **`patterntype:`** | Controls interpretation: `literal`, `regexp`, `keyword`, `structural`. | `literal` and `keyword` accepted. `regexp` and `structural` not supported. |
+| **`patterntype:`** | Controls interpretation: `literal`, `regexp`, `keyword`, `structural`. | `literal`, `keyword`, and `regexp` supported. `structural` not supported. |
 | **`@revision` syntax** | `repo:foo@branch` to pin a revision. | Supported — splits into `repo:foo` + `rev:branch`. |
 | **`timeout:`, `stable:`** | Query execution controls. | Not supported (queries run locally and complete fast). |
 
@@ -135,13 +151,14 @@ Most queries port directly:
 | Sourcegraph query | CodeDB equivalent |
 |---|---|
 | `lang:go fmt.Sprintf` | `lang:go fmt.Sprintf` (identical) |
-| `file:\.py$ import requests` | `file:*.py import requests` (use GLOB instead of regex) |
+| `file:\.py$ import requests` | `file:*.py import requests` (use GLOB wildcards for file filters) |
 | `repo:myorg/myrepo error` | `repo:myrepo error` (substring match on repo name) |
 | `type:diff author:alice fix` | `type:diff author:alice fix` (identical) |
 | `type:symbol lang:rust Iterator` | `type:symbol lang:rust Iterator` (identical) |
 | `repo:foo@develop query` | `repo:foo@develop query` (identical — `@` syntax supported) |
-| `patterntype:regexp err\d+` | Not directly supported — use `codedb sql` with Tantivy regex mode |
-| `(foo OR bar) lang:go` | Run as two separate queries, or use raw SQL |
+| `patterntype:regexp err\d+` | `patterntype:regexp err\d+` (identical) or `/err\d+/` |
+| `foo OR bar lang:go` | `lang:go foo OR bar` (identical) |
+| `(foo OR bar) AND baz` | Not supported — no parenthesized grouping |
 
 **When the query language isn't enough**, use `codedb search --sql` to see the
 generated SQL, then adapt it with `codedb sql` for full control — including

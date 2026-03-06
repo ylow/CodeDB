@@ -18,30 +18,20 @@ feasibility and value.
 Accepted as no-ops (already the default behavior). `patterntype:regexp` and
 `patterntype:structural` produce a clear error message.
 
-## Moderate effort, high value
+## Moderate effort, high value (done)
 
-### 4. Regex in code/diff search
+### 4. Regex in code/diff search — DONE
 
-Support `/pattern/` syntax for regex matching in full-text search.
+`/pattern/` syntax and `patterntype:regexp` supported for code and diff search.
+Passes regex mode to the Tantivy virtual table. Errors clearly for symbol/commit
+search where SQL-level regex isn't available.
 
-Tantivy already has a regex mode in `query_builder.rs`. The work is:
-- Detect `/pattern/` syntax in the parser
-- Pass a mode flag through to the Tantivy virtual table query string
-  (e.g., a `regex:` prefix convention in the vtab query)
-- Does NOT help SQL-level matching (symbol names, commit messages), but
-  those are the less common case
+### 5. `OR` for search terms — DONE
 
-This is the highest-value moderate-effort feature — regex is the most common
-Sourcegraph capability that users would expect to work.
-
-### 5. `OR` for search terms
-
-Support `foo OR bar` to match either term.
-
-Tantivy naturally handles multi-term queries with OR semantics. For SQL-level
-queries (symbol, commit), generating `(col LIKE '%foo%' OR col LIKE '%bar%')`
-is straightforward. The real work is parsing — need to distinguish `foo OR bar`
-from `foo bar` (implicit AND). Not trivial but not huge.
+`foo OR bar` splits search terms into OR groups. For code/diff search, passed
+through to Tantivy which handles OR natively. For symbol/commit search,
+generates `(col LIKE '%foo%' OR col LIKE '%bar%')` SQL.
+Regex + OR combination is rejected at parse time.
 
 ## Probably not worth it
 

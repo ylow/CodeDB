@@ -45,9 +45,25 @@ pub struct Filters {
 /// Result of parsing a Sourcegraph-style query string.
 #[derive(Debug, Clone)]
 pub struct ParsedQuery {
-    pub search_pattern: String,
+    /// Search terms grouped by OR. Each group is space-joined AND terms.
+    /// For example, `foo bar OR baz` → `["foo bar", "baz"]`.
+    /// A single group (no OR) is the common case.
+    pub search_terms: Vec<String>,
     pub search_type: SearchType,
+    pub is_regex: bool,
     pub filters: Filters,
+}
+
+impl ParsedQuery {
+    /// Combined search pattern (all OR groups joined with " OR ").
+    pub fn search_pattern(&self) -> String {
+        self.search_terms.join(" OR ")
+    }
+
+    /// True if there are no search terms at all.
+    pub fn has_empty_pattern(&self) -> bool {
+        self.search_terms.is_empty() || self.search_terms.iter().all(|t| t.is_empty())
+    }
 }
 
 /// SQL query ready for execution, with bound parameters.
@@ -136,11 +152,14 @@ fn parse_select(value: &str) -> Result<SelectType> {
 /// `count:`, `case:`, `author:`, `before:`, `after:`, `message:`, `select:`.
 ///
 /// Everything that isn't a filter becomes the search pattern.
+/// Use `/pattern/` or `patterntype:regexp` for regex matching.
+/// Use `OR` between search terms for disjunction.
 pub fn parse_query(input: &str) -> Result<ParsedQuery> {
     let tokens = tokenize(input);
     let mut filters = Filters::default();
     let mut search_type = SearchType::Code;
     let mut search_terms: Vec<String> = Vec::new();
+    let mut force_regex = false;
 
     for token in &tokens {
         let (negated, rest) = if let Some(r) = token.strip_prefix('-') {
@@ -194,9 +213,10 @@ pub fn parse_query(input: &str) -> Result<ParsedQuery> {
                 }
                 (false, "patterntype") => match value {
                     "literal" | "keyword" => {} // default behavior
+                    "regexp" => force_regex = true,
                     other => bail!(
                         "Unsupported pattern type '{other}'. \
-                         Only 'literal' and 'keyword' are supported"
+                         Valid: literal, keyword, regexp"
                     ),
                 },
                 (false, "author") => {
@@ -236,6 +256,9 @@ pub fn parse_query(input: &str) -> Result<ParsedQuery> {
                     search_terms.push(token.clone());
                 }
             }
+        } else if token == "OR" {
+            // OR separator between search term groups
+            search_terms.push("OR".to_string());
         } else {
             // Not a filter — it's a search term
             let term = token.trim_matches('"');
@@ -243,11 +266,50 @@ pub fn parse_query(input: &str) -> Result<ParsedQuery> {
         }
     }
 
-    let search_pattern = search_terms.join(" ");
+    // Split search terms by OR into groups
+    let mut or_groups: Vec<String> = Vec::new();
+    let mut current_group: Vec<String> = Vec::new();
+    for term in &search_terms {
+        if term == "OR" {
+            if !current_group.is_empty() {
+                or_groups.push(current_group.join(" "));
+                current_group.clear();
+            }
+        } else {
+            current_group.push(term.clone());
+        }
+    }
+    if !current_group.is_empty() {
+        or_groups.push(current_group.join(" "));
+    }
+
+    // Detect /regex/ pattern or patterntype:regexp
+    let mut is_regex = force_regex;
+    if !is_regex
+        && or_groups.len() == 1
+        && or_groups.first().is_some_and(|p| {
+            p.starts_with('/') && p.ends_with('/') && p.len() >= 2
+        })
+    {
+        is_regex = true;
+        // Strip the surrounding slashes
+        let pat = &or_groups[0];
+        or_groups[0] = pat[1..pat.len() - 1].to_string();
+    }
+
+    if is_regex && !or_groups.is_empty() {
+        if or_groups.iter().all(|g| g.is_empty()) {
+            bail!("Empty regex pattern");
+        }
+        if or_groups.len() > 1 {
+            bail!("Regex patterns cannot be combined with OR");
+        }
+    }
 
     Ok(ParsedQuery {
-        search_pattern,
+        search_terms: or_groups,
         search_type,
+        is_regex,
         filters,
     })
 }
@@ -295,6 +357,23 @@ fn pattern_match_clause(column: &str, pattern: &str, p: &mut ParamCollector) -> 
     }
 }
 
+/// Match a column against multiple OR-grouped patterns.
+///
+/// Generates `(col LIKE '%a%' OR col LIKE '%b%')` for `["a", "b"]`,
+/// or a single `col LIKE '%a%'` for `["a"]`.
+fn or_match_clause(column: &str, groups: &[String], p: &mut ParamCollector) -> String {
+    let clauses: Vec<String> = groups
+        .iter()
+        .filter(|g| !g.is_empty())
+        .map(|g| pattern_match_clause(column, g, p))
+        .collect();
+    if clauses.len() == 1 {
+        clauses.into_iter().next().unwrap()
+    } else {
+        format!("({})", clauses.join(" OR "))
+    }
+}
+
 /// Translate a parsed query into SQL.
 pub fn translate(query: &ParsedQuery) -> Result<TranslatedQuery> {
     // calls:, calledby:, and returns: imply symbol search regardless of type:
@@ -316,12 +395,13 @@ pub fn translate(query: &ParsedQuery) -> Result<TranslatedQuery> {
 }
 
 fn translate_code(query: &ParsedQuery) -> Result<TranslatedQuery> {
-    if query.search_pattern.is_empty() {
+    if query.has_empty_pattern() {
         bail!("Code search requires a search pattern");
     }
 
     let mut p = ParamCollector::new(query.filters.case_sensitive);
-    let search_param = p.add(query.search_pattern.clone());
+    // For Tantivy: join OR groups with " OR " — Tantivy's query parser handles OR natively
+    let search_param = p.add(query.search_pattern());
 
     let mut joins = vec![
         "JOIN blobs b ON b.id = cs.blob_id".to_string(),
@@ -408,9 +488,15 @@ fn translate_code(query: &ParsedQuery) -> Result<TranslatedQuery> {
         format!("\n  {}", conditions.join("\n  "))
     };
 
+    let vtab_call = if query.is_regex {
+        format!("code_search({search_param}, 'regex')")
+    } else {
+        format!("code_search({search_param})")
+    };
+
     let sql = format!(
         "{select_clause}\n\
-         FROM code_search({search_param}) cs\n\
+         FROM {vtab_call} cs\n\
          {joins_str}\n\
          WHERE 1=1{conditions_str}\n\
          {group_by}\n\
@@ -433,12 +519,12 @@ fn translate_code(query: &ParsedQuery) -> Result<TranslatedQuery> {
 }
 
 fn translate_diff(query: &ParsedQuery) -> Result<TranslatedQuery> {
-    if query.search_pattern.is_empty() {
+    if query.has_empty_pattern() {
         bail!("Diff search requires a search pattern");
     }
 
     let mut p = ParamCollector::new(query.filters.case_sensitive);
-    let search_param = p.add(query.search_pattern.clone());
+    let search_param = p.add(query.search_pattern());
 
     let mut joins = vec![
         "JOIN diffs d ON d.id = ds.diff_id".to_string(),
@@ -516,9 +602,15 @@ fn translate_diff(query: &ParsedQuery) -> Result<TranslatedQuery> {
         _ => "ORDER BY ds.score DESC",
     };
 
+    let vtab_call = if query.is_regex {
+        format!("diff_search({search_param}, 'regex')")
+    } else {
+        format!("diff_search({search_param})")
+    };
+
     let sql = format!(
         "{select_clause}\n\
-         FROM diff_search({search_param}) ds\n\
+         FROM {vtab_call} ds\n\
          {joins_str}\n\
          WHERE 1=1{conditions_str}\n\
          {order_by}\n\
@@ -533,11 +625,14 @@ fn translate_diff(query: &ParsedQuery) -> Result<TranslatedQuery> {
 }
 
 fn translate_commit(query: &ParsedQuery) -> Result<TranslatedQuery> {
+    if query.is_regex {
+        bail!("Regex patterns are only supported for code and diff search");
+    }
     let mut p = ParamCollector::new(query.filters.case_sensitive);
     let mut conditions = Vec::new();
 
-    if !query.search_pattern.is_empty() {
-        let clause = pattern_match_clause("c.message", &query.search_pattern, &mut p);
+    if !query.has_empty_pattern() {
+        let clause = or_match_clause("c.message", &query.search_terms, &mut p);
         conditions.push(format!("AND {clause}"));
     }
 
@@ -625,6 +720,9 @@ fn translate_commit(query: &ParsedQuery) -> Result<TranslatedQuery> {
 }
 
 fn translate_symbol(query: &ParsedQuery) -> Result<TranslatedQuery> {
+    if query.is_regex {
+        bail!("Regex patterns are only supported for code and diff search");
+    }
     let mut p = ParamCollector::new(query.filters.case_sensitive);
     let mut joins = vec![
         "JOIN blobs b ON b.id = s.blob_id".to_string(),
@@ -633,8 +731,8 @@ fn translate_symbol(query: &ParsedQuery) -> Result<TranslatedQuery> {
     ];
     let mut conditions = Vec::new();
 
-    if !query.search_pattern.is_empty() {
-        let clause = pattern_match_clause("s.name", &query.search_pattern, &mut p);
+    if !query.has_empty_pattern() {
+        let clause = or_match_clause("s.name", &query.search_terms, &mut p);
         conditions.push(format!("AND {clause}"));
     }
 
@@ -694,7 +792,7 @@ fn translate_symbol(query: &ParsedQuery) -> Result<TranslatedQuery> {
     let rev_placeholder = p.add(rev_ref);
     conditions.push(format!("AND r.name = {rev_placeholder}"));
 
-    if query.search_pattern.is_empty()
+    if query.has_empty_pattern()
         && !matches!(query.filters.select, Some(SelectType::SymbolKind(_)))
         && query.filters.lang.is_none()
         && query.filters.file.is_none()
@@ -734,6 +832,9 @@ fn translate_symbol(query: &ParsedQuery) -> Result<TranslatedQuery> {
 
 /// Translate `calls:X` — find functions that call X.
 fn translate_callers(query: &ParsedQuery) -> Result<TranslatedQuery> {
+    if query.is_regex {
+        bail!("Regex patterns are only supported for code and diff search");
+    }
     let call_target = query.filters.calls.as_ref().unwrap();
     let mut p = ParamCollector::new(query.filters.case_sensitive);
     let mut joins = vec![
@@ -822,6 +923,9 @@ fn translate_callers(query: &ParsedQuery) -> Result<TranslatedQuery> {
 
 /// Translate `calledby:X` — find what function X calls.
 fn translate_callees(query: &ParsedQuery) -> Result<TranslatedQuery> {
+    if query.is_regex {
+        bail!("Regex patterns are only supported for code and diff search");
+    }
     let caller_name = query.filters.calledby.as_ref().unwrap();
     let mut p = ParamCollector::new(query.filters.case_sensitive);
     let mut joins = vec![
@@ -956,7 +1060,7 @@ mod tests {
     #[test]
     fn test_parse_bare_search() {
         let q = parse_query("foo bar").unwrap();
-        assert_eq!(q.search_pattern, "foo bar");
+        assert_eq!(q.search_pattern(), "foo bar");
         assert_eq!(q.search_type, SearchType::Code);
         assert!(q.filters.repo.is_none());
     }
@@ -964,7 +1068,7 @@ mod tests {
     #[test]
     fn test_parse_with_filters() {
         let q = parse_query("lang:rust file:*.rs process_data").unwrap();
-        assert_eq!(q.search_pattern, "process_data");
+        assert_eq!(q.search_pattern(), "process_data");
         assert_eq!(q.filters.lang.as_deref(), Some("rust"));
         assert_eq!(q.filters.file.as_deref(), Some("*.rs"));
         assert_eq!(q.search_type, SearchType::Code);
@@ -974,7 +1078,7 @@ mod tests {
     fn test_parse_type_symbol() {
         let q = parse_query("type:symbol lang:rust SFrame").unwrap();
         assert_eq!(q.search_type, SearchType::Symbol);
-        assert_eq!(q.search_pattern, "SFrame");
+        assert_eq!(q.search_pattern(), "SFrame");
         assert_eq!(q.filters.lang.as_deref(), Some("rust"));
     }
 
@@ -982,7 +1086,7 @@ mod tests {
     fn test_parse_type_diff() {
         let q = parse_query("type:diff author:ylow streaming").unwrap();
         assert_eq!(q.search_type, SearchType::Diff);
-        assert_eq!(q.search_pattern, "streaming");
+        assert_eq!(q.search_pattern(), "streaming");
         assert_eq!(q.filters.author.as_deref(), Some("ylow"));
     }
 
@@ -990,7 +1094,7 @@ mod tests {
     fn test_parse_type_commit() {
         let q = parse_query("type:commit before:2026-01-01 after:2025-06-01 refactor").unwrap();
         assert_eq!(q.search_type, SearchType::Commit);
-        assert_eq!(q.search_pattern, "refactor");
+        assert_eq!(q.search_pattern(), "refactor");
         assert_eq!(q.filters.before.as_deref(), Some("2026-01-01"));
         assert_eq!(q.filters.after.as_deref(), Some("2025-06-01"));
     }
@@ -999,7 +1103,7 @@ mod tests {
     fn test_parse_negated_file() {
         let q = parse_query("-file:test foo").unwrap();
         assert_eq!(q.filters.neg_file.as_deref(), Some("test"));
-        assert_eq!(q.search_pattern, "foo");
+        assert_eq!(q.search_pattern(), "foo");
     }
 
     #[test]
@@ -1026,7 +1130,7 @@ mod tests {
     #[test]
     fn test_parse_quoted_phrase() {
         let q = parse_query("lang:rust \"foo bar\"").unwrap();
-        assert_eq!(q.search_pattern, "foo bar");
+        assert_eq!(q.search_pattern(), "foo bar");
     }
 
     #[test]
@@ -1051,7 +1155,7 @@ mod tests {
     #[test]
     fn test_parse_unknown_filter_is_search_term() {
         let q = parse_query("http://example.com foo").unwrap();
-        assert_eq!(q.search_pattern, "http://example.com foo");
+        assert_eq!(q.search_pattern(), "http://example.com foo");
     }
 
     #[test]
@@ -1238,7 +1342,7 @@ mod tests {
     fn test_parse_calls_filter() {
         let q = parse_query("calls:groupby").unwrap();
         assert_eq!(q.filters.calls.as_deref(), Some("groupby"));
-        assert!(q.search_pattern.is_empty());
+        assert!(q.has_empty_pattern());
     }
 
     #[test]
@@ -1539,18 +1643,178 @@ mod tests {
     #[test]
     fn test_parse_patterntype_literal() {
         let q = parse_query("patterntype:literal foo").unwrap();
-        assert_eq!(q.search_pattern, "foo");
+        assert_eq!(q.search_pattern(), "foo");
     }
 
     #[test]
     fn test_parse_patterntype_keyword() {
         let q = parse_query("patterntype:keyword foo").unwrap();
-        assert_eq!(q.search_pattern, "foo");
+        assert_eq!(q.search_pattern(), "foo");
+    }
+
+    #[test]
+    fn test_parse_patterntype_regexp() {
+        let q = parse_query("patterntype:regexp foo").unwrap();
+        assert!(q.is_regex);
+        assert_eq!(q.search_pattern(), "foo");
     }
 
     #[test]
     fn test_parse_patterntype_unsupported() {
-        let err = parse_query("patterntype:regexp foo").unwrap_err();
+        let err = parse_query("patterntype:structural foo").unwrap_err();
         assert!(err.to_string().contains("Unsupported pattern type"), "got: {err}");
+    }
+
+    // --- regex tests ---
+
+    #[test]
+    fn test_parse_regex_pattern() {
+        let q = parse_query("/err\\d+/").unwrap();
+        assert!(q.is_regex);
+        assert_eq!(q.search_pattern(), "err\\d+");
+    }
+
+    #[test]
+    fn test_parse_regex_with_filters() {
+        let q = parse_query("lang:rust /fn\\s+\\w+/").unwrap();
+        assert!(q.is_regex);
+        assert_eq!(q.search_pattern(), "fn\\s+\\w+");
+        assert_eq!(q.filters.lang.as_deref(), Some("rust"));
+    }
+
+    #[test]
+    fn test_parse_not_regex_single_slash() {
+        // A single slash-containing term isn't regex
+        let q = parse_query("path/to/file").unwrap();
+        assert!(!q.is_regex);
+    }
+
+    #[test]
+    fn test_parse_empty_regex_error() {
+        let err = parse_query("//").unwrap_err();
+        assert!(err.to_string().contains("Empty regex"), "got: {err}");
+    }
+
+    #[test]
+    fn test_translate_code_regex() {
+        let q = parse_query("/err\\d+/").unwrap();
+        let t = translate(&q).unwrap();
+        assert!(t.sql.contains("code_search(?1, 'regex')"), "sql: {}", t.sql);
+        assert_eq!(t.params[0], "err\\d+");
+    }
+
+    #[test]
+    fn test_translate_diff_regex() {
+        let q = parse_query("type:diff /TODO.*/").unwrap();
+        let t = translate(&q).unwrap();
+        assert!(t.sql.contains("diff_search(?1, 'regex')"), "sql: {}", t.sql);
+    }
+
+    #[test]
+    fn test_translate_symbol_regex_error() {
+        let q = parse_query("type:symbol /foo.*/").unwrap();
+        let err = translate(&q).unwrap_err();
+        assert!(err.to_string().contains("only supported for code and diff"), "got: {err}");
+    }
+
+    #[test]
+    fn test_translate_commit_regex_error() {
+        let q = parse_query("type:commit /fix.*/").unwrap();
+        let err = translate(&q).unwrap_err();
+        assert!(err.to_string().contains("only supported for code and diff"), "got: {err}");
+    }
+
+    #[test]
+    fn test_translate_calls_regex_error() {
+        // patterntype:regexp with calls: — regex flag is set even without search terms
+        let q = parse_query("patterntype:regexp calls:foo").unwrap();
+        assert!(q.is_regex);
+        let err = translate(&q).unwrap_err();
+        assert!(err.to_string().contains("only supported for code and diff"), "got: {err}");
+    }
+
+    #[test]
+    fn test_translate_patterntype_regexp() {
+        let q = parse_query("patterntype:regexp fn_\\w+").unwrap();
+        let t = translate(&q).unwrap();
+        assert!(t.sql.contains("code_search(?1, 'regex')"), "sql: {}", t.sql);
+        assert_eq!(t.params[0], "fn_\\w+");
+    }
+
+    // --- OR operator tests ---
+
+    #[test]
+    fn test_parse_or_basic() {
+        let q = parse_query("foo OR bar").unwrap();
+        assert_eq!(q.search_terms, vec!["foo", "bar"]);
+        assert_eq!(q.search_pattern(), "foo OR bar");
+    }
+
+    #[test]
+    fn test_parse_or_three_groups() {
+        let q = parse_query("foo OR bar OR baz").unwrap();
+        assert_eq!(q.search_terms, vec!["foo", "bar", "baz"]);
+    }
+
+    #[test]
+    fn test_parse_or_with_multi_word_groups() {
+        let q = parse_query("error handling OR panic recovery").unwrap();
+        assert_eq!(q.search_terms, vec!["error handling", "panic recovery"]);
+    }
+
+    #[test]
+    fn test_parse_or_with_filters() {
+        let q = parse_query("lang:rust foo OR bar").unwrap();
+        assert_eq!(q.search_terms, vec!["foo", "bar"]);
+        assert_eq!(q.filters.lang.as_deref(), Some("rust"));
+    }
+
+    #[test]
+    fn test_parse_no_or() {
+        let q = parse_query("foo bar").unwrap();
+        assert_eq!(q.search_terms, vec!["foo bar"]);
+    }
+
+    #[test]
+    fn test_translate_code_or() {
+        // Tantivy handles OR natively — terms are joined with OR
+        let q = parse_query("foo OR bar").unwrap();
+        let t = translate(&q).unwrap();
+        assert!(t.sql.contains("code_search(?1)"), "sql: {}", t.sql);
+        assert_eq!(t.params[0], "foo OR bar");
+    }
+
+    #[test]
+    fn test_translate_symbol_or() {
+        let q = parse_query("type:symbol foo OR bar").unwrap();
+        let t = translate(&q).unwrap();
+        // SQL-level OR: (s.name LIKE ? OR s.name LIKE ?)
+        assert!(t.sql.contains("(s.name LIKE"), "sql: {}", t.sql);
+        assert!(t.sql.contains(" OR "), "sql: {}", t.sql);
+        assert!(t.params.iter().any(|p| p == "%foo%"), "params: {:?}", t.params);
+        assert!(t.params.iter().any(|p| p == "%bar%"), "params: {:?}", t.params);
+    }
+
+    #[test]
+    fn test_translate_commit_or() {
+        let q = parse_query("type:commit fix OR refactor").unwrap();
+        let t = translate(&q).unwrap();
+        assert!(t.sql.contains("(c.message LIKE"), "sql: {}", t.sql);
+        assert!(t.sql.contains(" OR "), "sql: {}", t.sql);
+    }
+
+    #[test]
+    fn test_parse_regex_with_or_not_detected() {
+        // /foo/ OR /bar/ — with OR, the /slashes/ span multiple groups so regex
+        // is NOT detected. The slashes are treated as literal characters.
+        let q = parse_query("/foo/ OR /bar/").unwrap();
+        assert!(!q.is_regex);
+        assert_eq!(q.search_terms, vec!["/foo/", "/bar/"]);
+    }
+
+    #[test]
+    fn test_patterntype_regexp_with_or_error() {
+        let err = parse_query("patterntype:regexp foo OR bar").unwrap_err();
+        assert!(err.to_string().contains("cannot be combined with OR"), "got: {err}");
     }
 }
