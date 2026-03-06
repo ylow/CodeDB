@@ -1,3 +1,6 @@
 [workspace]
 members = ["tantivy-sqlite", "codedb-core", "codedb-cli"]
 resolver = "2"
+
+[workspace.package]
+license = "BSD-3-Clause"

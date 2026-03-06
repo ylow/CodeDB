@@ -349,4 +349,4 @@ tree-sitter) are compiled from source — no system libraries needed.
 
 ## License
 
-MIT
+BSD-3-Clause
